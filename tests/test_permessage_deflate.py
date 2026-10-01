@@ -8,6 +8,8 @@ import pytest
 
 from wsproto import extensions as wpext
 from wsproto import frame_protocol as fp
+from wsproto.handshake import client_extensions_handshake, server_extensions_handshake
+from wsproto.utilities import RemoteProtocolError
 
 if TYPE_CHECKING:
     from typing import TypedDict
@@ -176,6 +178,214 @@ class TestPerMessageDeflate:
         ext.accept("i am the lizard queen; worship me")
 
         assert ext.enabled()
+
+    @pytest.mark.parametrize(
+        ("offer", "reason"),
+        [
+            ("other-extension", "extension name"),
+            ("permessage-deflate; unknown=1", "unknown"),
+            (
+                "permessage-deflate; client_no_context_takeover; "
+                "client_no_context_takeover",
+                "duplicate",
+            ),
+            (
+                "permessage-deflate; client_max_window_bits=10; "
+                "client_max_window_bits=10",
+                "duplicate",
+            ),
+            ("permessage-deflate; client_no_context_takeover=", "must not have a value"),
+            ("permessage-deflate; client_max_window_bits=", "must be an integer"),
+            ("permessage-deflate; client_max_window_bits=8", "between 9 and 15"),
+            ("permessage-deflate; client_max_window_bits=16", "between 9 and 15"),
+            ("permessage-deflate; client_max_window_bits=nine", "must be an integer"),
+            ("permessage-deflate; server_max_window_bits", "must have a value"),
+        ],
+    )
+    def test_strict_accept_rejects_invalid_offer(
+        self, offer: str, reason: str,
+    ) -> None:
+        ext = wpext.PerMessageDeflate(strict_negotiation=True)
+
+        with pytest.raises(ValueError) as excinfo:
+            ext._parse_params(
+                offer,
+                allow_client_max_window_bits_without_value=True,
+            )
+
+        assert reason in str(excinfo.value)
+        assert not ext.enabled()
+        assert ext.client_max_window_bits == 15
+        assert ext.server_max_window_bits == 15
+        assert not ext.client_no_context_takeover
+        assert not ext.server_no_context_takeover
+
+    def test_strict_accept_rejects_invalid_offer_without_changing_state(self) -> None:
+        ext = wpext.PerMessageDeflate(strict_negotiation=True)
+        offer = (
+            "permessage-deflate; client_no_context_takeover; "
+            "client_max_window_bits=10; client_max_window_bits=10"
+        )
+
+        with pytest.raises(ValueError, match="duplicate"):
+            ext.accept(offer)
+
+        assert not ext.enabled()
+        assert ext.client_max_window_bits == 15
+        assert not ext.client_no_context_takeover
+
+    def test_strict_constructor_alias(self) -> None:
+        assert wpext.PerMessageDeflate(strict=True).strict_negotiation is True
+
+    def test_strict_accept_negotiates_valid_offer(self) -> None:
+        ext = wpext.PerMessageDeflate(server_max_window_bits=12, strict_negotiation=True)
+        offer = (
+            "permessage-deflate; client_no_context_takeover; "
+            "client_max_window_bits; server_no_context_takeover; "
+            "server_max_window_bits=10"
+        )
+
+        response = ext.accept(offer)
+
+        assert response == (
+            "client_no_context_takeover; server_no_context_takeover; "
+            "client_max_window_bits=15; server_max_window_bits=10"
+        )
+        assert ext.enabled()
+        assert ext.client_no_context_takeover
+        assert ext.server_no_context_takeover
+        assert ext.client_max_window_bits == 15
+        assert ext.server_max_window_bits == 10
+
+    def test_strict_server_tries_later_candidate_after_failed_attempt(self) -> None:
+        ext = wpext.PerMessageDeflate(strict_negotiation=True)
+        invalid_offer = (
+            "permessage-deflate; client_no_context_takeover; "
+            "client_max_window_bits=10; client_max_window_bits=10"
+        )
+        valid_offer = "permessage-deflate; client_max_window_bits"
+
+        response = server_extensions_handshake([invalid_offer, valid_offer], [ext])
+
+        assert response == b"permessage-deflate; client_max_window_bits=15"
+        assert ext.enabled()
+        assert ext.client_max_window_bits == 15
+        assert not ext.client_no_context_takeover
+
+    def test_strict_server_choice_is_independent_of_offer_order(self) -> None:
+        invalid_offer = (
+            "permessage-deflate; client_no_context_takeover; "
+            "client_max_window_bits=10; client_max_window_bits=10"
+        )
+        valid_offer = "permessage-deflate; client_max_window_bits"
+
+        first_ext = wpext.PerMessageDeflate(strict_negotiation=True)
+        second_ext = wpext.PerMessageDeflate(strict_negotiation=True)
+
+        first_response = server_extensions_handshake(
+            [invalid_offer, valid_offer], [first_ext],
+        )
+        second_response = server_extensions_handshake(
+            [valid_offer, invalid_offer], [second_ext],
+        )
+
+        assert first_response == second_response
+        assert first_ext.client_max_window_bits == 15
+        assert second_ext.client_max_window_bits == 15
+
+    @pytest.mark.parametrize(
+        ("first_bits", "second_bits", "selected_bits"),
+        [(10, 12, 10), (12, 10, 12)],
+    )
+    def test_strict_server_uses_first_valid_candidate(
+        self, first_bits: int, second_bits: int, selected_bits: int,
+    ) -> None:
+        ext = wpext.PerMessageDeflate(strict_negotiation=True)
+
+        response = server_extensions_handshake(
+            [
+                f"permessage-deflate; server_max_window_bits={first_bits}",
+                f"permessage-deflate; server_max_window_bits={second_bits}",
+            ],
+            [ext],
+        )
+
+        assert response == (
+            f"permessage-deflate; server_max_window_bits={selected_bits}".encode()
+        )
+
+    def test_compatible_server_replaces_duplicate_extension_offer(self) -> None:
+        ext = wpext.PerMessageDeflate()
+
+        response = server_extensions_handshake(
+            [
+                "permessage-deflate; server_max_window_bits=10",
+                "permessage-deflate; server_max_window_bits=12",
+            ],
+            [ext],
+        )
+
+        assert response == b"permessage-deflate; server_max_window_bits=12"
+
+    @pytest.mark.parametrize(
+        ("response", "reason"),
+        [
+            ("permessage-deflate; unknown=1", "unknown"),
+            ("permessage-deflate; client_no_context_takeover", "not offered"),
+            ("permessage-deflate; client_max_window_bits", "must have a value"),
+            ("permessage-deflate; server_max_window_bits=", "must be an integer"),
+        ],
+    )
+    def test_strict_client_finalize_rejects_invalid_response(
+        self, response: str, reason: str,
+    ) -> None:
+        ext = wpext.PerMessageDeflate(strict_negotiation=True)
+
+        with pytest.raises(ValueError) as excinfo:
+            ext.finalize(response)
+
+        assert reason in str(excinfo.value)
+        assert not ext.enabled()
+
+    def test_strict_client_finalize_rejects_response_exceeding_offer(self) -> None:
+        ext = wpext.PerMessageDeflate(
+            client_max_window_bits=10,
+            server_max_window_bits=10,
+            strict_negotiation=True,
+        )
+
+        with pytest.raises(ValueError, match="exceeding offered"):
+            ext.finalize(
+                "permessage-deflate; client_max_window_bits=12; "
+                "server_max_window_bits=12",
+            )
+
+        assert not ext.enabled()
+        assert ext.client_max_window_bits == 10
+        assert ext.server_max_window_bits == 10
+
+    @pytest.mark.parametrize(
+        ("responses", "reason"),
+        [
+            (["permessage-deflate; unknown=1"], "unknown"),
+            (["permessage-deflate", "permessage-deflate"], "more than once"),
+            (["extra-extension"], "unrecognized extension"),
+            (
+                ["permessage-deflate; client_no_context_takeover"],
+                "not offered",
+            ),
+        ],
+    )
+    def test_strict_client_handshake_rejects_invalid_responses(
+        self, responses: list[str], reason: str,
+    ) -> None:
+        ext = wpext.PerMessageDeflate(strict_negotiation=True)
+
+        with pytest.raises(RemoteProtocolError) as excinfo:
+            client_extensions_handshake(responses, [ext])
+
+        assert reason in str(excinfo.value)
+        assert not ext.enabled()
 
     def test_inbound_uncompressed_control_frame(self) -> None:
         payload = b"x" * 23

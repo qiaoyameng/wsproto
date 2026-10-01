@@ -441,7 +441,8 @@ class H11Handshake:
                 event_hint=RejectConnection(),
             )
         extensions = client_extensions_handshake(
-            accepts, cast("Sequence[Extension]", self._initiating_request.extensions),
+            accepts,
+            cast("Sequence[Extension]", self._initiating_request.extensions),
         )
 
         self._connection = Connection(
@@ -466,21 +467,42 @@ def server_extensions_handshake(
 
     This returns None if there are no agreed extensions
     """
-    accepts: dict[str, bool | bytes] = {}
+    accepts: list[tuple[str, bool | bytes]] = []
+    accepted_names: set[str] = set()
+    accepted_indexes: dict[str, int] = {}
     for offer in requested:
         name = offer.split(";", 1)[0].strip()
         for extension in supported:
             if extension.name == name:
-                accept = extension.accept(offer)
+                if extension.strict_negotiation and name in accepted_names:
+                    continue
+                try:
+                    accept = extension.accept(offer)
+                except ValueError:
+                    if not extension.strict_negotiation:
+                        raise
+                    accept = None
                 if isinstance(accept, bool):
                     if accept:
-                        accepts[extension.name] = True
+                        accepted = (extension.name, True)
+                    else:
+                        break
                 elif accept is not None:
-                    accepts[extension.name] = accept.encode("ascii")
+                    accepted = (extension.name, accept.encode("ascii"))
+                else:
+                    break
+
+                if extension.strict_negotiation or name not in accepted_indexes:
+                    accepted_indexes[extension.name] = len(accepts)
+                    accepts.append(accepted)
+                else:
+                    accepts[accepted_indexes[extension.name]] = accepted
+                accepted_names.add(extension.name)
+                break
 
     if accepts:
         extensions: list[bytes] = []
-        for name, params in accepts.items():
+        for name, params in accepts:
             name_bytes = name.encode("ascii")
             if isinstance(params, bool):
                 assert params
@@ -499,17 +521,38 @@ def client_extensions_handshake(
 ) -> list[Extension]:
     # This raises RemoteProtocolError is the accepted extension is not
     # supported.
+    accepted = list(accepted)
     extensions = []
+    accepted_names: set[str] = set()
+    matched_extensions: list[Extension] = []
     for accept in accepted:
         name = accept.split(";", 1)[0].strip()
+        if name in accepted_names:
+            msg = f"server selected extension {name} more than once"
+            raise RemoteProtocolError(msg, event_hint=RejectConnection())
+        extension: Extension | None = None
         for extension in supported:
             if extension.name == name:
-                extension.finalize(accept)
-                extensions.append(extension)
                 break
-        else:
+        if extension is None or extension.name != name:
             msg = f"unrecognized extension {name}"
             raise RemoteProtocolError(
                 msg, event_hint=RejectConnection(),
             )
+
+        matched_extensions.append(extension)
+        accepted_names.add(name)
+
+    for extension, accept in zip(matched_extensions, accepted):
+        name = extension.name
+        try:
+            extension.finalize(accept)
+        except ValueError as exc:
+            if not extension.strict_negotiation:
+                raise
+            msg = f"invalid accepted extension {name}: {exc}"
+            raise RemoteProtocolError(
+                msg, event_hint=RejectConnection(),
+            ) from exc
+        extensions.append(extension)
     return extensions

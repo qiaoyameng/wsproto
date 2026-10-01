@@ -8,13 +8,22 @@ from __future__ import annotations
 
 import zlib
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from .frame_protocol import CloseReason, FrameDecoder, FrameProtocol, Opcode, RsvBits
 
 
+class _PerMessageDeflateParameters(NamedTuple):
+    client_no_context_takeover: bool
+    server_no_context_takeover: bool
+    client_max_window_bits: int | None
+    server_max_window_bits: int | None
+    client_max_window_bits_without_value: bool
+
+
 class Extension(ABC):
     name: str
+    strict_negotiation = False
 
     def enabled(self) -> bool:
         return False
@@ -71,9 +80,14 @@ class PerMessageDeflate(Extension):
         client_max_window_bits: int | None = None,
         server_no_context_takeover: bool = False,
         server_max_window_bits: int | None = None,
+        strict_negotiation: bool = False,
+        strict: bool | None = None,
     ) -> None:
+        if strict is not None:
+            strict_negotiation = strict
         self.client_no_context_takeover = client_no_context_takeover
         self.server_no_context_takeover = server_no_context_takeover
+        self.strict_negotiation = strict_negotiation
         self._client_max_window_bits = self.DEFAULT_CLIENT_MAX_WINDOW_BITS
         self._server_max_window_bits = self.DEFAULT_SERVER_MAX_WINDOW_BITS
         if client_max_window_bits is not None:
@@ -133,21 +147,101 @@ class PerMessageDeflate(Extension):
 
         return "; ".join(parameters)
 
-    def finalize(self, offer: str) -> None:
-        bits = [b.strip() for b in offer.split(";")]
+    def _parse_params(
+        self,
+        params: str,
+        *,
+        allow_client_max_window_bits_without_value: bool = False,
+    ) -> _PerMessageDeflateParameters:
+        bits = [b.strip() for b in params.split(";")]
+
+        if bits[0] != self.name:
+            msg = (
+                f"invalid {self.name} extension name: expected {self.name}, "
+                f"got {bits[0]!r}"
+            )
+            raise ValueError(msg)
+
+        client_no_context_takeover = False
+        server_no_context_takeover = False
+        client_max_window_bits: int | None = None
+        server_max_window_bits: int | None = None
+        client_max_window_bits_without_value = False
+
+        seen: set[str] = set()
         for bit in bits[1:]:
-            if bit.startswith("client_no_context_takeover"):
-                self.client_no_context_takeover = True
-            elif bit.startswith("server_no_context_takeover"):
-                self.server_no_context_takeover = True
-            elif bit.startswith("client_max_window_bits"):
-                self.client_max_window_bits = int(bit.split("=", 1)[1].strip())
-            elif bit.startswith("server_max_window_bits"):
-                self.server_max_window_bits = int(bit.split("=", 1)[1].strip())
+            if not bit:
+                msg = f"empty parameter in {self.name} extension offer"
+                raise ValueError(msg)
 
-        self._enabled = True
+            name, has_value, value = bit.partition("=")
+            if name in seen:
+                msg = f"duplicate {self.name} parameter {name!r}"
+                raise ValueError(msg)
 
-    def _parse_params(self, params: str) -> tuple[int | None, int | None]:
+            if name in (
+                "client_no_context_takeover",
+                "server_no_context_takeover",
+                "client_max_window_bits",
+                "server_max_window_bits",
+            ):
+                seen.add(name)
+            else:
+                msg = f"unknown {self.name} parameter {name!r}"
+                raise ValueError(msg)
+
+            if name in ("client_no_context_takeover", "server_no_context_takeover"):
+                if has_value:
+                    msg = f"{self.name} parameter {name!r} must not have a value"
+                    raise ValueError(msg)
+                if name == "client_no_context_takeover":
+                    client_no_context_takeover = True
+                else:
+                    server_no_context_takeover = True
+                continue
+
+            if not has_value:
+                if (
+                    name == "client_max_window_bits"
+                    and allow_client_max_window_bits_without_value
+                ):
+                    client_max_window_bits_without_value = True
+                else:
+                    msg = f"{self.name} parameter {name!r} must have a value"
+                    raise ValueError(msg)
+                continue
+
+            if not value or not value.isdigit():
+                msg = (
+                    f"{self.name} parameter {name!r} must be an integer between "
+                    f"9 and 15, got {value!r}"
+                )
+                raise ValueError(msg)
+
+            window_bits = int(value)
+            if window_bits < 9 or window_bits > 15:
+                msg = (
+                    f"{self.name} parameter {name!r} must be between 9 and 15 "
+                    f"inclusive, got {window_bits}"
+                )
+                raise ValueError(msg)
+
+            if name == "client_max_window_bits":
+                client_max_window_bits = window_bits
+            else:
+                server_max_window_bits = window_bits
+
+        return _PerMessageDeflateParameters(
+            client_no_context_takeover=client_no_context_takeover,
+            server_no_context_takeover=server_no_context_takeover,
+            client_max_window_bits=client_max_window_bits,
+            server_max_window_bits=server_max_window_bits,
+            client_max_window_bits_without_value=(
+                client_max_window_bits_without_value
+            ),
+        )
+
+    def _parse_legacy_params(self, params: str) -> tuple[int | None, int | None]:
         client_max_window_bits = None
         server_max_window_bits = None
 
@@ -170,27 +264,157 @@ class PerMessageDeflate(Extension):
 
         return client_max_window_bits, server_max_window_bits
 
+    def finalize(self, offer: str) -> None:
+        if self.strict_negotiation:
+            parsed = self._parse_params(offer)
+            offered = self._parse_params(
+                f"{self.name}; {self.offer()}",
+                allow_client_max_window_bits_without_value=True,
+            )
+
+            if (
+                parsed.client_no_context_takeover
+                and not offered.client_no_context_takeover
+            ):
+                msg = (
+                    f"server accepted {self.name} parameter "
+                    "'client_no_context_takeover' that was not offered"
+                )
+                raise ValueError(msg)
+            if (
+                parsed.client_max_window_bits is not None
+                and offered.client_max_window_bits is None
+            ):
+                msg = (
+                    f"server accepted {self.name} parameter "
+                    "'client_max_window_bits' that was not offered"
+                )
+                raise ValueError(msg)
+            if (
+                parsed.server_max_window_bits is not None
+                and offered.server_max_window_bits is None
+            ):
+                msg = (
+                    f"server accepted {self.name} parameter "
+                    "'server_max_window_bits' that was not offered"
+                )
+                raise ValueError(msg)
+            if (
+                parsed.client_max_window_bits is not None
+                and offered.client_max_window_bits is not None
+                and parsed.client_max_window_bits > offered.client_max_window_bits
+            ):
+                msg = (
+                    f"server accepted {self.name} client_max_window_bits="
+                    f"{parsed.client_max_window_bits}, exceeding offered "
+                    f"client_max_window_bits={offered.client_max_window_bits}"
+                )
+                raise ValueError(msg)
+            if (
+                parsed.server_max_window_bits is not None
+                and offered.server_max_window_bits is not None
+                and parsed.server_max_window_bits > offered.server_max_window_bits
+            ):
+                msg = (
+                    f"server accepted {self.name} server_max_window_bits="
+                    f"{parsed.server_max_window_bits}, exceeding offered "
+                    f"server_max_window_bits={offered.server_max_window_bits}"
+                )
+                raise ValueError(msg)
+
+            self.client_no_context_takeover = parsed.client_no_context_takeover
+            self.server_no_context_takeover = parsed.server_no_context_takeover
+            if parsed.client_max_window_bits is not None:
+                self.client_max_window_bits = parsed.client_max_window_bits
+            if parsed.server_max_window_bits is not None:
+                self.server_max_window_bits = parsed.server_max_window_bits
+            self._enabled = True
+            return
+
+        client_max_window_bits, server_max_window_bits = self._parse_legacy_params(
+            offer,
+        )
+        if client_max_window_bits is not None:
+            self.client_max_window_bits = client_max_window_bits
+        if server_max_window_bits is not None:
+            self.server_max_window_bits = server_max_window_bits
+        self._enabled = True
+
     def accept(self, offer: str) -> bool | None | str:
-        client_max_window_bits, server_max_window_bits = self._parse_params(offer)
+        if not self.strict_negotiation:
+            client_max_window_bits, server_max_window_bits = self._parse_legacy_params(
+                offer,
+            )
+
+            parameters = []
+
+            if self.client_no_context_takeover:
+                parameters.append("client_no_context_takeover")
+            if self.server_no_context_takeover:
+                parameters.append("server_no_context_takeover")
+            try:
+                if client_max_window_bits is not None:
+                    parameters.append(f"client_max_window_bits={client_max_window_bits}")
+                    self.client_max_window_bits = client_max_window_bits
+                if server_max_window_bits is not None:
+                    parameters.append(f"server_max_window_bits={server_max_window_bits}")
+                    self.server_max_window_bits = server_max_window_bits
+            except ValueError:
+                return None
+
+            self._enabled = True
+            return "; ".join(parameters)
+
+        parsed = self._parse_params(
+            offer,
+            allow_client_max_window_bits_without_value=True,
+        )
+
+        client_max_window_bits: int | None = None
+        server_max_window_bits: int | None = None
+
+        offered_client_max_window_bits = (
+            self.client_max_window_bits
+            if parsed.client_max_window_bits_without_value
+            else parsed.client_max_window_bits
+        )
+        offered_server_max_window_bits = parsed.server_max_window_bits
+
+        if offered_client_max_window_bits is not None:
+            client_max_window_bits = offered_client_max_window_bits
+            client_max_window_bits = min(
+                self.client_max_window_bits, client_max_window_bits,
+            )
+        if offered_server_max_window_bits is not None:
+            server_max_window_bits = offered_server_max_window_bits
+            server_max_window_bits = min(
+                self.server_max_window_bits, server_max_window_bits,
+            )
 
         parameters = []
 
-        if self.client_no_context_takeover:
+        if parsed.client_no_context_takeover:
             parameters.append("client_no_context_takeover")
-        if self.server_no_context_takeover:
+        if self.server_no_context_takeover or parsed.server_no_context_takeover:
             parameters.append("server_no_context_takeover")
-        try:
-            if client_max_window_bits is not None:
-                parameters.append(f"client_max_window_bits={client_max_window_bits}")
-                self.client_max_window_bits = client_max_window_bits
-            if server_max_window_bits is not None:
-                parameters.append(f"server_max_window_bits={server_max_window_bits}")
-                self.server_max_window_bits = server_max_window_bits
-        except ValueError:
-            return None
-        else:
-            self._enabled = True
-            return "; ".join(parameters)
+        if client_max_window_bits is not None:
+            parameters.append(
+                f"client_max_window_bits={client_max_window_bits}",
+            )
+        if server_max_window_bits is not None:
+            parameters.append(
+                f"server_max_window_bits={server_max_window_bits}",
+            )
+
+        self.client_no_context_takeover = parsed.client_no_context_takeover
+        self.server_no_context_takeover = parsed.server_no_context_takeover
+        if client_max_window_bits is not None:
+            self.client_max_window_bits = client_max_window_bits
+        if server_max_window_bits is not None:
+            self.server_max_window_bits = server_max_window_bits
+        self._enabled = True
+
+        return "; ".join(parameters)
 
     def frame_inbound_header(
         self,

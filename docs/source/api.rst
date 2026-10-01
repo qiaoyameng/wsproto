@@ -99,6 +99,9 @@ Extensions
 .. autoclass:: wsproto.extensions.Extension
    :members:
 
+.. autoclass:: wsproto.extensions.PerMessageDeflate
+   :members:
+
 .. autodata:: wsproto.extensions.SUPPORTED_EXTENSIONS
 
 Exceptions
