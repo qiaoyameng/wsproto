@@ -10,7 +10,14 @@ import zlib
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from .frame_protocol import CloseReason, FrameDecoder, FrameProtocol, Opcode, RsvBits
+from .frame_protocol import (
+    CloseReason,
+    FrameDecoder,
+    FrameProtocol,
+    Opcode,
+    PayloadSourceLevel,
+    RsvBits,
+)
 
 
 class Extension(ABC):
@@ -42,6 +49,10 @@ class Extension(ABC):
         self, proto: FrameDecoder | FrameProtocol, data: bytes,
     ) -> bytes | CloseReason:
         return data
+
+    def frame_inbound_payload_source_level(self) -> PayloadSourceLevel:
+        """Describe whether inbound payload data is byte-mappable."""
+        return PayloadSourceLevel.BYTE
 
     def frame_inbound_complete(
         self, proto: FrameDecoder | FrameProtocol, fin: bool,
@@ -230,6 +241,12 @@ class PerMessageDeflate(Extension):
             return self._decompressor.decompress(bytes(data))
         except zlib.error:
             return CloseReason.INVALID_FRAME_PAYLOAD_DATA
+
+    def frame_inbound_payload_source_level(self) -> PayloadSourceLevel:
+        """Compressed data only has frame-level wire provenance."""
+        if self._inbound_compressed and self._inbound_is_compressible:
+            return PayloadSourceLevel.FRAME
+        return PayloadSourceLevel.BYTE
 
     def frame_inbound_complete(
         self, proto: FrameDecoder | FrameProtocol, fin: bool,

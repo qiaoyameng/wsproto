@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from .extensions import Extension
+    from .frame_protocol import FrameSource
     from .typing import Headers
 
 
@@ -184,14 +185,25 @@ class CloseConnection(Event):
 
        Additional reasoning for why the connection has closed.
 
+    .. attribute:: frame_source
+
+       When frame source tracking is enabled, the location of the received
+       close frame in the WebSocket frame stream. This is not propagated to
+       the event returned by :meth:`response`.
+
     """
 
     code: int
     reason: str | None = None
+    frame_source: FrameSource | None = None
 
     def response(self) -> CloseConnection:
         """Generate an RFC-compliant close frame to send back to the peer."""
-        return CloseConnection(code=self.code, reason=self.reason)
+        return CloseConnection(
+            code=self.code,
+            reason=self.reason,
+            frame_source=None,
+        )
 
 
 T = TypeVar("T", bytes | bytearray, str)
@@ -222,11 +234,18 @@ class Message(Event, Generic[T]):
        True if this frame is the last one of this message, False if
        more frames are expected.
 
+    .. attribute:: frame_source
+
+       When frame source tracking is enabled, the wire location and sequence
+       numbers of this message fragment. Compressed payloads may identify the
+       complete frame rather than mapping event bytes one-to-one.
+
     """
 
     data: T
     frame_finished: bool = True
     message_finished: bool = True
+    frame_source: FrameSource | None = None
 
 
 @dataclass(frozen=True)
@@ -277,13 +296,20 @@ class Ping(Event):
     .. attribute:: payload
 
        An optional payload to emit with the ping frame.
+
+    .. attribute:: frame_source
+
+       When frame source tracking is enabled, the location of the received
+       ping frame in the WebSocket frame stream. This is not propagated to
+       the pong returned by :meth:`response`.
     """
 
     payload: bytes = b""
+    frame_source: FrameSource | None = None
 
     def response(self) -> Pong:
         """Generate an RFC-compliant :class:`Pong` response to this ping."""
-        return Pong(payload=self.payload)
+        return Pong(payload=self.payload, frame_source=None)
 
 
 @dataclass(frozen=True)
@@ -297,6 +323,12 @@ class Pong(Event):
 
        An optional payload to emit with the pong frame.
 
+    .. attribute:: frame_source
+
+       When frame source tracking is enabled, the location of the received
+       pong frame in the WebSocket frame stream.
+
     """
 
     payload: bytes = b""
+    frame_source: FrameSource | None = None

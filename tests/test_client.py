@@ -9,12 +9,14 @@ from wsproto import WSConnection
 from wsproto.connection import CLIENT, ConnectionState
 from wsproto.events import (
     AcceptConnection,
+    BytesMessage,
     Event,
     RejectConnection,
     RejectData,
     Request,
 )
 from wsproto.extensions import Extension
+from wsproto.frame_protocol import ByteRange
 from wsproto.typing import Headers
 from wsproto.utilities import (
     LocalProtocolError,
@@ -184,6 +186,37 @@ def test_handshake() -> None:
         101, [(b"connection", b"Upgrade"), (b"upgrade", b"websocket")],
     )
     assert events == [AcceptConnection()]
+
+
+def test_frame_sources_start_after_handshake() -> None:
+    client = WSConnection(CLIENT, track_frame_sources=True)
+    server = h11.Connection(h11.SERVER)
+    server.receive_data(
+        client.send(Request(host="localhost", target="/")),
+    )
+    request = cast("h11.Request", server.next_event())
+    request_headers = normed_header_dict(request.headers)
+    response = h11.InformationalResponse(
+        status_code=101,
+        headers=[
+            (b"connection", b"Upgrade"),
+            (b"upgrade", b"websocket"),
+            (
+                b"Sec-WebSocket-Accept",
+                generate_accept_token(request_headers[b"sec-websocket-key"]),
+            ),
+        ],
+    )
+
+    client.receive_data(server.send(response) + b"\x82\x02xy")
+    events = list(client.events())
+
+    assert events[0] == AcceptConnection()
+    assert isinstance(events[1], BytesMessage)
+    assert events[1].data == b"xy"
+    assert events[1].frame_source is not None
+    assert events[1].frame_source.header == ByteRange(0, 2)
+    assert events[1].frame_source.payload == ByteRange(2, 4)
 
 
 def test_broken_handshake() -> None:

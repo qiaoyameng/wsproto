@@ -4,6 +4,8 @@ Release History
 1.4.0 (unreleased)
 ------------------
 
+- Add optional frame source metadata with wire byte offsets, frame and
+  message sequence numbers, and byte- or frame-level payload provenance.
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
 

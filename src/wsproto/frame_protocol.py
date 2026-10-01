@@ -10,7 +10,8 @@ import contextlib
 import os
 import struct
 from codecs import IncrementalDecoder, getincrementaldecoder
-from enum import IntEnum
+from dataclasses import dataclass, replace
+from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
@@ -224,6 +225,43 @@ class RsvBits(NamedTuple):
     rsv3: bool
 
 
+class ByteRange(NamedTuple):
+    """A half-open byte range in a connection's WebSocket frame stream."""
+
+    start: int
+    end: int
+
+
+class PayloadSourceLevel(Enum):
+    """The relationship between event payload bytes and wire payload bytes."""
+
+    BYTE = "byte"
+    FRAME = "frame"
+
+
+@dataclass(frozen=True)
+class FrameSource:
+    """
+    Location of a received event in the WebSocket frame stream.
+
+    Byte offsets are zero-based and counted from the first byte after the
+    opening handshake. Ranges are half-open. Control frames have frame
+    metadata but no message or fragment number.
+
+    ``BYTE`` payload sources map directly to wire payload bytes. ``FRAME``
+    payload sources identify the complete frame only, which is used when an
+    extension such as permessage-deflate changes the payload length.
+    """
+
+    frame_number: int
+    header: ByteRange
+    payload: ByteRange
+    message_number: int | None = None
+    fragment_number: int | None = None
+    mask: ByteRange | None = None
+    payload_source_level: PayloadSourceLevel = PayloadSourceLevel.BYTE
+
+
 class Header(NamedTuple):
     fin: bool
     rsv: RsvBits
@@ -237,6 +275,7 @@ class Frame(NamedTuple):
     payload: bytes | str | tuple[int, str]
     frame_finished: bool
     message_finished: bool
+    source: FrameSource | None = None
 
 
 def _truncate_utf8(data: bytes, nbytes: int) -> bytes:
@@ -258,6 +297,7 @@ class Buffer:
     def __init__(self, initial_bytes: bytes | None = None) -> None:
         self.buffer = bytearray()
         self.bytes_used = 0
+        self.stream_position = 0
         if initial_bytes:
             self.feed(initial_bytes)
 
@@ -280,6 +320,7 @@ class Buffer:
 
     def commit(self) -> None:
         # In CPython 3.4+, del[:n] is amortized O(n), *not* quadratic
+        self.stream_position += self.bytes_used
         del self.buffer[: self.bytes_used]
         self.bytes_used = 0
 
@@ -321,7 +362,13 @@ class MessageDecoder:
             except UnicodeDecodeError as exc:
                 raise ParseFailed(str(exc), CloseReason.INVALID_FRAME_PAYLOAD_DATA)
 
-        frame = Frame(self.opcode, data, frame.frame_finished, finished)
+        frame = Frame(
+            self.opcode,
+            data,
+            frame.frame_finished,
+            finished,
+            frame.source,
+        )
 
         if finished:
             self.opcode = None
@@ -332,10 +379,14 @@ class MessageDecoder:
 
 class FrameDecoder:
     def __init__(
-        self, client: bool, extensions: list[Extension] | None = None,
+        self,
+        client: bool,
+        extensions: list[Extension] | None = None,
+        track_frame_sources: bool = False,
     ) -> None:
         self.client = client
         self.extensions = extensions or []
+        self.track_frame_sources = track_frame_sources
 
         self.buffer = Buffer()
 
@@ -344,6 +395,13 @@ class FrameDecoder:
         self.masker: None | XorMaskerNull | XorMaskerSimple = None
         self.payload_required = 0
         self.payload_consumed = 0
+        self.frames_received = 0
+        self.frame_number = 0
+        self.frame_start = 0
+        self.header_end = 0
+        self.mask_start: int | None = None
+        self.payload_start = 0
+        self.payload_source_level = PayloadSourceLevel.BYTE
 
     def receive_bytes(self, data: bytes) -> None:
         self.buffer.feed(data)
@@ -360,9 +418,11 @@ class FrameDecoder:
             return None
 
         payload_remaining = self.header.payload_len - self.payload_consumed
+        wire_payload_start = self.buffer.stream_position + self.buffer.bytes_used
         payload = self.buffer.consume_at_most(payload_remaining)
         if not payload and self.header.payload_len > 0:
             return None
+        wire_payload_end = self.buffer.stream_position + self.buffer.bytes_used
         self.buffer.commit()
 
         self.payload_consumed += len(payload)
@@ -388,7 +448,34 @@ class FrameDecoder:
                     final += result
             payload += final
 
-        frame = Frame(self.effective_opcode, bytes(payload), finished, self.header.fin)
+        source = None
+        if self.track_frame_sources:
+            if self.payload_source_level is PayloadSourceLevel.FRAME:
+                source_payload = ByteRange(
+                    self.payload_start,
+                    self.payload_start + self.header.payload_len,
+                )
+            else:
+                source_payload = ByteRange(wire_payload_start, wire_payload_end)
+            source = FrameSource(
+                frame_number=self.frame_number,
+                header=ByteRange(self.frame_start, self.header_end),
+                payload=source_payload,
+                mask=(
+                    None
+                    if self.mask_start is None
+                    else ByteRange(self.mask_start, self.payload_start)
+                ),
+                payload_source_level=self.payload_source_level,
+            )
+
+        frame = Frame(
+            self.effective_opcode,
+            bytes(payload),
+            finished,
+            self.header.fin,
+            source,
+        )
 
         if finished:
             self.header = None
@@ -400,6 +487,7 @@ class FrameDecoder:
         return frame
 
     def parse_header(self) -> bool:
+        frame_start = self.buffer.stream_position + self.buffer.bytes_used
         data = self.buffer.consume_exactly(2)
         if data is None:
             self.buffer.rollback()
@@ -429,6 +517,7 @@ class FrameDecoder:
             self.buffer.rollback()
             return False
 
+        header_end = self.buffer.stream_position + self.buffer.bytes_used
         self.extension_processing(opcode, rsv, payload_len)
 
         if has_mask and self.client:
@@ -442,11 +531,22 @@ class FrameDecoder:
             if masking_key is None:
                 self.buffer.rollback()
                 return False
+            mask_start = header_end
             self.masker = XorMaskerSimple(masking_key)
         else:
+            mask_start = None
             self.masker = XorMaskerNull()
 
         self.buffer.commit()
+        payload_start = self.buffer.stream_position
+        if self.track_frame_sources:
+            self.frame_number = self.frames_received
+            self.frame_start = frame_start
+            self.header_end = header_end
+            self.mask_start = mask_start
+            self.payload_start = payload_start
+            self.payload_source_level = self._payload_source_level()
+        self.frames_received += 1
         self.header = Header(fin, rsv, opcode, payload_len, None)
         self.effective_opcode = self.header.opcode
         if self.header.opcode.iscontrol():
@@ -455,6 +555,15 @@ class FrameDecoder:
             self.payload_required = 0
         self.payload_consumed = 0
         return True
+
+    def _payload_source_level(self) -> PayloadSourceLevel:
+        for extension in self.extensions:
+            if (
+                extension.frame_inbound_payload_source_level()
+                is PayloadSourceLevel.FRAME
+            ):
+                return PayloadSourceLevel.FRAME
+        return PayloadSourceLevel.BYTE
 
     def parse_extended_payload_length(
         self, opcode: Opcode, payload_len: int,
@@ -509,16 +618,29 @@ class FrameDecoder:
 
 
 class FrameProtocol:
-    def __init__(self, client: bool, extensions: list[Extension]) -> None:
+    def __init__(
+        self,
+        client: bool,
+        extensions: list[Extension],
+        track_frame_sources: bool = False,
+    ) -> None:
         self.client = client
         self.extensions = [ext for ext in extensions if ext.enabled()]
 
         # Global state
-        self._frame_decoder = FrameDecoder(self.client, self.extensions)
+        self._frame_decoder = FrameDecoder(
+            self.client,
+            self.extensions,
+            track_frame_sources,
+        )
         self._message_decoder = MessageDecoder()
         self._parse_more = self._parse_more_gen()
 
         self._outbound_opcode: Opcode | None = None
+        self._message_number = 0
+        self._fragment_number = 0
+        self._message_in_progress = False
+        self._last_data_frame_number: int | None = None
 
     def _process_close(self, frame: Frame) -> Frame:
         data = frame.payload
@@ -553,7 +675,49 @@ class FrameProtocol:
                 )
             data = (code, reason)
 
-        return Frame(frame.opcode, data, frame.frame_finished, frame.message_finished)
+        return Frame(
+            frame.opcode,
+            data,
+            frame.frame_finished,
+            frame.message_finished,
+            frame.source,
+        )
+
+    def _annotate_frame(self, frame: Frame) -> Frame:
+        source = frame.source
+        if source is None or frame.opcode.iscontrol():
+            return frame
+
+        if source.frame_number != self._last_data_frame_number:
+            if not self._message_in_progress:
+                self._fragment_number = 0
+                self._message_in_progress = True
+            else:
+                self._fragment_number += 1
+            self._last_data_frame_number = source.frame_number
+
+        source = replace(
+            source,
+            message_number=self._message_number,
+            fragment_number=self._fragment_number,
+        )
+        return Frame(
+            frame.opcode,
+            frame.payload,
+            frame.frame_finished,
+            frame.message_finished,
+            source,
+        )
+
+    def _message_finished(self, frame: Frame) -> None:
+        if (
+            frame.frame_finished
+            and frame.message_finished
+            and not frame.opcode.iscontrol()
+        ):
+            self._message_number += 1
+            self._fragment_number = 0
+            self._message_in_progress = False
 
     def _parse_more_gen(self) -> Generator[Frame | None, None, None]:
         # Consume as much as we can from self._buffer, yielding events, and
@@ -569,7 +733,9 @@ class FrameProtocol:
 
             if frame is not None:
                 if not frame.opcode.iscontrol():
+                    frame = self._annotate_frame(frame)
                     frame = self._message_decoder.process_frame(frame)
+                    self._message_finished(frame)
                 elif frame.opcode == Opcode.CLOSE:
                     frame = self._process_close(frame)
                     closed = True

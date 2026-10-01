@@ -25,15 +25,21 @@ class WSConnection:
     Represents the local end of a WebSocket connection to a remote peer.
     """
 
-    def __init__(self, connection_type: ConnectionType) -> None:
+    def __init__(
+        self,
+        connection_type: ConnectionType,
+        track_frame_sources: bool = False,
+    ) -> None:
         """
         Constructor
 
         :param wsproto.connection.ConnectionType connection_type: Controls
             whether the library behaves as a client or as a server.
+        :param bool track_frame_sources: Attach wire byte offsets and sequence
+            numbers to received WebSocket events after the handshake.
         """
         self.client = connection_type is ConnectionType.CLIENT
-        self.handshake = H11Handshake(connection_type)
+        self.handshake = H11Handshake(connection_type, track_frame_sources)
         self.connection: Connection | None = None
 
     @property

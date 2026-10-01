@@ -90,6 +90,15 @@ Frame Protocol
 .. autoclass:: wsproto.frame_protocol.Opcode
    :members:
 
+.. autoclass:: wsproto.frame_protocol.ByteRange
+   :members:
+
+.. autoclass:: wsproto.frame_protocol.PayloadSourceLevel
+   :members:
+
+.. autoclass:: wsproto.frame_protocol.FrameSource
+   :members:
+
 .. autoclass:: wsproto.frame_protocol.CloseReason
    :members:
 

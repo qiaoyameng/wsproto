@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import zlib
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional, cast
@@ -8,6 +9,9 @@ import pytest
 
 from wsproto import extensions as wpext
 from wsproto import frame_protocol as fp
+from wsproto.connection import CLIENT, SERVER, Connection
+from wsproto.events import BytesMessage
+from wsproto.frame_protocol import ByteRange, PayloadSourceLevel
 
 if TYPE_CHECKING:
     from typing import TypedDict
@@ -53,6 +57,87 @@ class TestPerMessageDeflate:
         {"client_max_window_bits": None, "server_max_window_bits": None},
         {},
     ]
+
+    def test_frame_sources_cover_compressed_wire_payload(self) -> None:
+        sender_extension = wpext.PerMessageDeflate()
+        sender_extension.finalize("permessage-deflate; client_max_window_bits=15")
+        receiver_extension = wpext.PerMessageDeflate()
+        receiver_extension.finalize("permessage-deflate; client_max_window_bits=15")
+
+        sender = Connection(CLIENT, [sender_extension])
+        wire_data = sender.send(BytesMessage(b"hello" * 20))
+        payload_length = wire_data[1] & 0x7F
+
+        receiver = Connection(
+            SERVER,
+            [receiver_extension],
+            track_frame_sources=True,
+        )
+        receiver.receive_data(wire_data)
+        event = next(receiver.events())
+
+        assert isinstance(event, BytesMessage)
+        assert event.data == b"hello" * 20
+        assert event.frame_source is not None
+        assert event.frame_source.header == ByteRange(0, 2)
+        assert event.frame_source.mask == ByteRange(2, 6)
+        assert event.frame_source.payload == ByteRange(
+            6,
+            6 + payload_length,
+        )
+        assert event.frame_source.payload_source_level is PayloadSourceLevel.FRAME
+
+    def test_compressed_frame_sources_are_stable_across_chunking(self) -> None:
+        sender_extension = wpext.PerMessageDeflate()
+        sender_extension.finalize("permessage-deflate; client_max_window_bits=15")
+        wire_data = Connection(CLIENT, [sender_extension]).send(
+            BytesMessage(b"hello" * 20),
+        )
+        payload_length = wire_data[1] & 0x7F
+
+        def collect(chunks: list[bytes]) -> tuple[bytes, set, set]:
+            receiver_extension = wpext.PerMessageDeflate()
+            receiver_extension.finalize(
+                "permessage-deflate; client_max_window_bits=15",
+            )
+            receiver = Connection(
+                SERVER,
+                [receiver_extension],
+                track_frame_sources=True,
+            )
+            payload = bytearray()
+            ranges = set()
+            levels = set()
+            for chunk in chunks:
+                receiver.receive_data(chunk)
+                for event in receiver.events():
+                    if isinstance(event, BytesMessage):
+                        assert event.frame_source is not None
+                        payload += event.data
+                        ranges.add(event.frame_source.payload)
+                        levels.add(event.frame_source.payload_source_level)
+            return bytes(payload), ranges, levels
+
+        random_cuts = sorted(random.Random(9).sample(range(1, len(wire_data)), 5))
+        random_bounds = [0, *random_cuts, len(wire_data)]
+        chunkings = [
+            [wire_data],
+            [wire_data[index : index + 1] for index in range(len(wire_data))],
+            [
+                wire_data[start:end]
+                for start, end in zip(random_bounds, random_bounds[1:])
+            ],
+        ]
+
+        results = [collect(chunks) for chunks in chunkings]
+
+        assert [result[0] for result in results] == [b"hello" * 20] * 3
+        assert [result[1] for result in results] == [
+            {ByteRange(6, 6 + payload_length)},
+        ] * 3
+        assert [result[2] for result in results] == [
+            {PayloadSourceLevel.FRAME},
+        ] * 3
 
     def make_offer_string(self, params: Params) -> str:
         offer = ["permessage-deflate"]

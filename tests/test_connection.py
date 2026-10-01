@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import random
+from collections import defaultdict
+from collections.abc import Callable
+
 import pytest
 
 from wsproto.connection import CLIENT, SERVER, Connection, ConnectionState
@@ -11,7 +15,7 @@ from wsproto.events import (
     Request,
     TextMessage,
 )
-from wsproto.frame_protocol import CloseReason
+from wsproto.frame_protocol import ByteRange, CloseReason, PayloadSourceLevel
 from wsproto.utilities import LocalProtocolError
 
 
@@ -169,3 +173,210 @@ def test_receive_data_when_closed() -> None:
     client._state = ConnectionState.CLOSED
     with pytest.raises(LocalProtocolError):
         client.receive_data(b"something")
+
+
+def _frame(opcode: int, payload: bytes, fin: bool = True) -> bytes:
+    return bytes([(0x80 if fin else 0) | opcode, len(payload)]) + payload
+
+
+def _merge_ranges(ranges: list[ByteRange]) -> tuple[ByteRange, ...]:
+    merged: list[list[int]] = []
+    for start, end in sorted(ranges):
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return tuple(ByteRange(start, end) for start, end in merged)
+
+
+def _collect_sources(
+    stream: bytes,
+    chunks: Callable[[bytes], list[bytes]],
+) -> dict[int, tuple]:
+    connection = Connection(CLIENT, track_frame_sources=True)
+    collected: dict[int, dict] = defaultdict(
+        lambda: {
+            "data": bytearray(),
+            "headers": set(),
+            "masks": set(),
+            "payload": [],
+            "levels": set(),
+            "message_numbers": set(),
+            "fragment_numbers": set(),
+            "frame_finished": False,
+            "message_finished": False,
+            "types": set(),
+        },
+    )
+
+    for chunk in chunks(stream):
+        connection.receive_data(chunk)
+        for event in connection.events():
+            source = event.frame_source
+            assert source is not None
+            entry = collected[source.frame_number]
+            entry["types"].add(type(event).__name__)
+            entry["headers"].add(source.header)
+            if source.mask is not None:
+                entry["masks"].add(source.mask)
+            entry["payload"].append(source.payload)
+            entry["levels"].add(source.payload_source_level)
+            entry["message_numbers"].add(source.message_number)
+            entry["fragment_numbers"].add(source.fragment_number)
+            entry["frame_finished"] = entry["frame_finished"] or getattr(
+                event,
+                "frame_finished",
+                True,
+            )
+            entry["message_finished"] = entry["message_finished"] or getattr(
+                event,
+                "message_finished",
+                True,
+            )
+            if isinstance(event, BytesMessage):
+                entry["data"] += event.data
+            elif isinstance(event, Ping):
+                entry["data"] += event.payload
+            elif isinstance(event, CloseConnection):
+                entry["data"] += int(event.code).to_bytes(2, "big")
+                if event.reason:
+                    entry["data"] += event.reason.encode()
+
+    return {
+        frame_number: (
+            tuple(sorted(entry["types"])),
+            tuple(entry["message_numbers"]),
+            tuple(entry["fragment_numbers"]),
+            tuple(sorted(entry["headers"])),
+            tuple(sorted(entry["masks"])),
+            _merge_ranges(entry["payload"]),
+            tuple(sorted(entry["levels"], key=lambda level: level.value)),
+            bytes(entry["data"]),
+            entry["frame_finished"],
+            entry["message_finished"],
+        )
+        for frame_number, entry in collected.items()
+    }
+
+
+def _single_chunk(data: bytes) -> list[bytes]:
+    return [data]
+
+
+def _byte_chunks(data: bytes) -> list[bytes]:
+    return [data[index : index + 1] for index in range(len(data))]
+
+
+def _random_chunks(data: bytes) -> list[bytes]:
+    cuts = sorted(random.Random(1234).sample(range(1, len(data)), 8))
+    bounds = [0, *cuts, len(data)]
+    return [data[start:end] for start, end in zip(bounds, bounds[1:])]
+
+
+def test_frame_sources_are_stable_across_chunking() -> None:
+    stream = b"".join(
+        [
+            _frame(0x2, b"ab", fin=False),
+            _frame(0x9, b"p"),
+            _frame(0x0, b"cd", fin=True),
+            _frame(0x2, b"ef"),
+            _frame(0x8, (1000).to_bytes(2, "big")),
+        ],
+    )
+
+    results = [
+        _collect_sources(stream, _single_chunk),
+        _collect_sources(stream, _byte_chunks),
+        _collect_sources(stream, _random_chunks),
+    ]
+
+    assert results[0] == results[1] == results[2]
+    assert results[0] == {
+        0: (
+            ("BytesMessage",),
+            (0,),
+            (0,),
+            (ByteRange(0, 2),),
+            (),
+            (ByteRange(2, 4),),
+            (PayloadSourceLevel.BYTE,),
+            b"ab",
+            True,
+            False,
+        ),
+        1: (
+            ("Ping",),
+            (None,),
+            (None,),
+            (ByteRange(4, 6),),
+            (),
+            (ByteRange(6, 7),),
+            (PayloadSourceLevel.BYTE,),
+            b"p",
+            True,
+            True,
+        ),
+        2: (
+            ("BytesMessage",),
+            (0,),
+            (1,),
+            (ByteRange(7, 9),),
+            (),
+            (ByteRange(9, 11),),
+            (PayloadSourceLevel.BYTE,),
+            b"cd",
+            True,
+            True,
+        ),
+        3: (
+            ("BytesMessage",),
+            (1,),
+            (0,),
+            (ByteRange(11, 13),),
+            (),
+            (ByteRange(13, 15),),
+            (PayloadSourceLevel.BYTE,),
+            b"ef",
+            True,
+            True,
+        ),
+        4: (
+            ("CloseConnection",),
+            (None,),
+            (None,),
+            (ByteRange(15, 17),),
+            (),
+            (ByteRange(17, 19),),
+            (PayloadSourceLevel.BYTE,),
+            (1000).to_bytes(2, "big"),
+            True,
+            True,
+        ),
+    }
+
+
+def test_frame_sources_include_mask_ranges() -> None:
+    masking_key = b"abcd"
+    payload = b"xy"
+    frame = b"\x81\x82" + masking_key + bytes(
+        value ^ masking_key[index % 4]
+        for index, value in enumerate(payload)
+    )
+
+    connection = Connection(SERVER, track_frame_sources=True)
+    connection.receive_data(frame)
+    event = next(connection.events())
+
+    assert event.frame_source is not None
+    assert event.frame_source.header == ByteRange(0, 2)
+    assert event.frame_source.mask == ByteRange(2, 6)
+    assert event.frame_source.payload == ByteRange(6, 8)
+
+
+def test_frame_sources_default_to_none() -> None:
+    connection = Connection(CLIENT)
+    connection.receive_data(_frame(0x2, b"xy"))
+    event = next(connection.events())
+
+    assert event == BytesMessage(data=b"xy")
+    assert event.frame_source is None

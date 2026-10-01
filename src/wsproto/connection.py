@@ -75,6 +75,7 @@ class Connection:
         connection_type: ConnectionType,
         extensions: list[Extension] | None = None,
         trailing_data: bytes = b"",
+        track_frame_sources: bool = False,
     ) -> None:
         """
         Constructor
@@ -85,10 +86,16 @@ class Connection:
         :param list extensions: The proposed extensions.
         :param bytes trailing_data: Data that has been received, but not yet
             processed.
+        :param bool track_frame_sources: Attach wire byte offsets and sequence
+            numbers to received events.
         """
         self.client = connection_type is ConnectionType.CLIENT
         self._events: deque[Event] = deque()
-        self._proto = FrameProtocol(self.client, extensions or [])
+        self._proto = FrameProtocol(
+            self.client,
+            extensions or [],
+            track_frame_sources,
+        )
         self._state = ConnectionState.OPEN
         self.receive_data(trailing_data)
 
@@ -174,13 +181,13 @@ class Connection:
                     assert frame.frame_finished
                     assert frame.message_finished
                     assert isinstance(frame.payload, (bytes, bytearray))
-                    yield Ping(payload=frame.payload)
+                    yield Ping(payload=frame.payload, frame_source=frame.source)
 
                 elif frame.opcode is Opcode.PONG:
                     assert frame.frame_finished
                     assert frame.message_finished
                     assert isinstance(frame.payload, (bytes, bytearray))
-                    yield Pong(payload=frame.payload)
+                    yield Pong(payload=frame.payload, frame_source=frame.source)
 
                 elif frame.opcode is Opcode.CLOSE:
                     assert isinstance(frame.payload, tuple)
@@ -189,7 +196,11 @@ class Connection:
                         self._state = ConnectionState.CLOSED
                     else:
                         self._state = ConnectionState.REMOTE_CLOSING
-                    yield CloseConnection(code=code, reason=reason)
+                    yield CloseConnection(
+                        code=code,
+                        reason=reason,
+                        frame_source=frame.source,
+                    )
 
                 elif frame.opcode is Opcode.TEXT:
                     assert isinstance(frame.payload, str)
@@ -197,6 +208,7 @@ class Connection:
                         data=frame.payload,
                         frame_finished=frame.frame_finished,
                         message_finished=frame.message_finished,
+                        frame_source=frame.source,
                     )
 
                 elif frame.opcode is Opcode.BINARY:
@@ -205,6 +217,7 @@ class Connection:
                         data=frame.payload,
                         frame_finished=frame.frame_finished,
                         message_finished=frame.message_finished,
+                        frame_source=frame.source,
                     )
 
                 else:
