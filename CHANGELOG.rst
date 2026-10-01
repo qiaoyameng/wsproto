@@ -4,6 +4,13 @@ Release History
 1.4.0 (unreleased)
 ------------------
 
+- Add ``max_inbound_message_size`` to ``wsproto.Connection`` and
+  ``wsproto.frame_protocol.FrameProtocol`` to limit the size of received
+  messages. The limit is counted in bytes after decompression, accumulated
+  across all continuation frames of a message, and decompression itself is
+  bounded by the remaining budget so that compressed payloads cannot expand
+  beyond it. Messages exceeding the limit are rejected with a 1009
+  (MESSAGE_TOO_BIG) close event.
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
 

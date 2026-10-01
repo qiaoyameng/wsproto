@@ -332,10 +332,20 @@ class MessageDecoder:
 
 class FrameDecoder:
     def __init__(
-        self, client: bool, extensions: list[Extension] | None = None,
+        self,
+        client: bool,
+        extensions: list[Extension] | None = None,
+        max_inbound_message_size: int | None = None,
     ) -> None:
         self.client = client
         self.extensions = extensions or []
+        # Maximum accepted size of a single message, measured in bytes
+        # *after* extension (e.g. decompression) processing. None disables
+        # the limit.
+        self.max_inbound_message_size = max_inbound_message_size
+        # Decompressed bytes seen so far for the message currently being
+        # received. This is not reset by interleaved control frames.
+        self.inbound_message_bytes = 0
 
         self.buffer = Buffer()
 
@@ -387,6 +397,15 @@ class FrameDecoder:
                 if result is not None:
                     final += result
             payload += final
+
+        if not self.header.opcode.iscontrol():
+            self.inbound_message_bytes += len(payload)
+            if (
+                self.max_inbound_message_size is not None
+                and self.inbound_message_bytes > self.max_inbound_message_size
+            ):
+                msg = "Message exceeds maximum inbound message size"
+                raise ParseFailed(msg, CloseReason.MESSAGE_TOO_BIG)
 
         frame = Frame(self.effective_opcode, bytes(payload), finished, self.header.fin)
 
@@ -453,6 +472,10 @@ class FrameDecoder:
             self.payload_required = payload_len
         else:
             self.payload_required = 0
+            if self.header.opcode is not Opcode.CONTINUATION:
+                # A new message starts; interleaved control frames do not
+                # reset the count.
+                self.inbound_message_bytes = 0
         self.payload_consumed = 0
         return True
 
@@ -509,12 +532,19 @@ class FrameDecoder:
 
 
 class FrameProtocol:
-    def __init__(self, client: bool, extensions: list[Extension]) -> None:
+    def __init__(
+        self,
+        client: bool,
+        extensions: list[Extension],
+        max_inbound_message_size: int | None = None,
+    ) -> None:
         self.client = client
         self.extensions = [ext for ext in extensions if ext.enabled()]
 
         # Global state
-        self._frame_decoder = FrameDecoder(self.client, self.extensions)
+        self._frame_decoder = FrameDecoder(
+            self.client, self.extensions, max_inbound_message_size,
+        )
         self._message_decoder = MessageDecoder()
         self._parse_more = self._parse_more_gen()
 

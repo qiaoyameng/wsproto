@@ -75,6 +75,7 @@ class Connection:
         connection_type: ConnectionType,
         extensions: list[Extension] | None = None,
         trailing_data: bytes = b"",
+        max_inbound_message_size: int | None = None,
     ) -> None:
         """
         Constructor
@@ -85,10 +86,18 @@ class Connection:
         :param list extensions: The proposed extensions.
         :param bytes trailing_data: Data that has been received, but not yet
             processed.
+        :param max_inbound_message_size: The maximum accepted size in bytes of
+            a single received message, counted after decompression and
+            accumulated across all of its (continuation) frames. A message
+            that exceeds the limit is rejected with a
+            ``CloseReason.MESSAGE_TOO_BIG`` (1009) close event. ``None`` (the
+            default) disables the limit.
         """
         self.client = connection_type is ConnectionType.CLIENT
         self._events: deque[Event] = deque()
-        self._proto = FrameProtocol(self.client, extensions or [])
+        self._proto = FrameProtocol(
+            self.client, extensions or [], max_inbound_message_size,
+        )
         self._state = ConnectionState.OPEN
         self.receive_data(trailing_data)
 

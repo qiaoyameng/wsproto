@@ -13,6 +13,19 @@ from typing import Optional
 from .frame_protocol import CloseReason, FrameDecoder, FrameProtocol, Opcode, RsvBits
 
 
+def _decompression_budget(proto: FrameDecoder | FrameProtocol) -> int:
+    # The maximum number of bytes the decompressor may emit right now, in a
+    # form suitable for zlib's max_length argument (0 means unlimited). One
+    # byte of slack is added so that a message exceeding the limit can be
+    # detected and rejected, while a message exactly at the limit completes.
+    if not isinstance(proto, FrameDecoder):
+        return 0
+    limit = proto.max_inbound_message_size
+    if limit is None:
+        return 0
+    return max(limit - proto.inbound_message_bytes, 0) + 1
+
+
 class Extension(ABC):
     name: str
 
@@ -227,7 +240,9 @@ class PerMessageDeflate(Extension):
         assert self._decompressor is not None
 
         try:
-            return self._decompressor.decompress(bytes(data))
+            return self._decompressor.decompress(
+                bytes(data), _decompression_budget(proto),
+            )
         except zlib.error:
             return CloseReason.INVALID_FRAME_PAYLOAD_DATA
 
@@ -245,8 +260,15 @@ class PerMessageDeflate(Extension):
         assert self._decompressor is not None
 
         try:
-            data = self._decompressor.decompress(b"\x00\x00\xff\xff")
-            data += self._decompressor.flush()
+            max_length = _decompression_budget(proto)
+            data = self._decompressor.decompress(b"\x00\x00\xff\xff", max_length)
+            if max_length == 0 or len(data) < max_length:
+                # The budget was not exhausted, so all input was consumed and
+                # the pending output is bounded by the budget. If the budget
+                # was exhausted the message is over the limit (the frame
+                # decoder will reject it), and flushing could expand an
+                # unbounded amount of pending output, so skip it.
+                data += self._decompressor.flush()
         except zlib.error:
             return CloseReason.INVALID_FRAME_PAYLOAD_DATA
 

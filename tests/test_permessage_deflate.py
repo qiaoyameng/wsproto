@@ -367,7 +367,7 @@ class TestPerMessageDeflate:
         assert result.rsv1
 
         class FailDecompressor:
-            def decompress(self, data: bytes) -> bytes:
+            def decompress(self, data: bytes, max_length: int = 0) -> bytes:
                 return b""
 
             def flush(self) -> None:
