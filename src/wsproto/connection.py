@@ -197,6 +197,7 @@ class Connection:
                         data=frame.payload,
                         frame_finished=frame.frame_finished,
                         message_finished=frame.message_finished,
+                        frame_source=frame.source,
                     )
 
                 elif frame.opcode is Opcode.BINARY:
@@ -205,6 +206,7 @@ class Connection:
                         data=frame.payload,
                         frame_finished=frame.frame_finished,
                         message_finished=frame.message_finished,
+                        frame_source=frame.source,
                     )
 
                 else:

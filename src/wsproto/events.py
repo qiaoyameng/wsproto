@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from .extensions import Extension
+    from .frame_protocol import FrameSource
     from .typing import Headers
 
 
@@ -222,11 +223,26 @@ class Message(Event, Generic[T]):
        True if this frame is the last one of this message, False if
        more frames are expected.
 
+    .. attribute:: frame_source
+
+       Optional :class:`wsproto.frame_protocol.FrameSource` metadata
+       describing where this chunk came from in the connection's inbound
+       byte stream: the byte ranges of the frame header, masking key and
+       payload (counted from the start of the frame stream), plus the
+       message and frame (fragment) indices. This is populated for received
+       events and is ``None`` for locally constructed events. It is ignored
+       for equality comparisons.
+
+       For messages transformed by an extension (e.g. compressed with
+       permessage-deflate) the payload range only identifies the frame's
+       bytes on the wire; it does not map the delivered (decompressed) data
+       back to individual wire bytes.
     """
 
     data: T
     frame_finished: bool = True
     message_finished: bool = True
+    frame_source: FrameSource | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)

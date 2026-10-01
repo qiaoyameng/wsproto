@@ -87,6 +87,9 @@ required, while others have default values.
 Frame Protocol
 --------------
 
+.. autoclass:: wsproto.frame_protocol.FrameSource
+   :members:
+
 .. autoclass:: wsproto.frame_protocol.Opcode
    :members:
 

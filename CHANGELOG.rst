@@ -4,6 +4,10 @@ Release History
 1.4.0 (unreleased)
 ------------------
 
+- Add optional ``frame_source`` metadata to received ``Message`` events,
+  recording the frame's header/mask/payload byte ranges (counted from the
+  start of the connection's frame stream) and the message and frame
+  indices, so events can be aligned with the raw byte stream.
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
 

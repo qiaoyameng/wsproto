@@ -224,6 +224,60 @@ class RsvBits(NamedTuple):
     rsv3: bool
 
 
+class FrameSource(NamedTuple):
+    """
+    Provenance metadata describing where a received frame (or frame chunk)
+    came from in the connection's inbound byte stream.
+
+    All offsets are byte offsets counted from the first byte of the frame
+    stream on this connection (i.e. the first byte passed to
+    :meth:`FrameDecoder.receive_bytes`). Ranges are half-open,
+    ``start <= offset < end``.
+
+    .. attribute:: message_index
+
+       The 0-based index of the data message this frame belongs to, counted
+       over the data messages received on this connection. Control frames
+       (ping/pong/close) do not advance this counter, so control frames
+       interleaved inside a fragmented message do not disturb the numbering
+       of the surrounding message fragments.
+
+    .. attribute:: frame_index
+
+       The 0-based index of the frame (fragment) within the message. Every
+       chunk produced from the same wire frame shares the same
+       ``(message_index, frame_index)`` pair, even when the frame's bytes
+       were delivered across multiple ``receive_data`` calls.
+
+    .. attribute:: header_start, header_end
+
+       The byte range of the frame header (the fin/rsv/opcode byte, the
+       mask/length byte, and any extended payload length bytes).
+
+    .. attribute:: mask_start, mask_end
+
+       The byte range of the 4-byte masking key, or ``None`` if the frame
+       was not masked.
+
+    .. attribute:: payload_start, payload_end
+
+       The byte range of the wire payload bytes consumed to produce this
+       chunk. For frames transformed by an extension (e.g. compressed with
+       permessage-deflate) this only identifies the frame's bytes on the
+       wire; it is not a mapping from the (decompressed) event payload bytes
+       back to individual wire bytes.
+    """
+
+    message_index: int
+    frame_index: int
+    header_start: int
+    header_end: int
+    mask_start: int | None
+    mask_end: int | None
+    payload_start: int
+    payload_end: int
+
+
 class Header(NamedTuple):
     fin: bool
     rsv: RsvBits
@@ -237,6 +291,7 @@ class Frame(NamedTuple):
     payload: bytes | str | tuple[int, str]
     frame_finished: bool
     message_finished: bool
+    source: FrameSource | None = None
 
 
 def _truncate_utf8(data: bytes, nbytes: int) -> bytes:
@@ -278,10 +333,12 @@ class Buffer:
 
         return self.consume_at_most(nbytes)
 
-    def commit(self) -> None:
+    def commit(self) -> int:
         # In CPython 3.4+, del[:n] is amortized O(n), *not* quadratic
+        committed = self.bytes_used
         del self.buffer[: self.bytes_used]
         self.bytes_used = 0
+        return committed
 
     def rollback(self) -> None:
         self.bytes_used = 0
@@ -321,7 +378,7 @@ class MessageDecoder:
             except UnicodeDecodeError as exc:
                 raise ParseFailed(str(exc), CloseReason.INVALID_FRAME_PAYLOAD_DATA)
 
-        frame = Frame(self.opcode, data, frame.frame_finished, finished)
+        frame = Frame(self.opcode, data, frame.frame_finished, finished, frame.source)
 
         if finished:
             self.opcode = None
@@ -345,6 +402,21 @@ class FrameDecoder:
         self.payload_required = 0
         self.payload_consumed = 0
 
+        # Number of frame-stream bytes consumed (committed) so far. All
+        # FrameSource offsets are relative to this stream position.
+        self._stream_offset = 0
+        # Message/frame numbering for the frames being parsed. Control
+        # frames do not affect these counters.
+        self._message_index = -1
+        self._frame_index = 0
+        # Provenance of the frame currently being parsed.
+        self._frame_message_index = 0
+        self._frame_frame_index = 0
+        self._frame_header_start = 0
+        self._frame_header_end = 0
+        self._frame_mask_start: int | None = None
+        self._frame_mask_end: int | None = None
+
     def receive_bytes(self, data: bytes) -> None:
         self.buffer.feed(data)
 
@@ -360,10 +432,12 @@ class FrameDecoder:
             return None
 
         payload_remaining = self.header.payload_len - self.payload_consumed
+        payload_start = self._stream_offset + self.buffer.bytes_used
         payload = self.buffer.consume_at_most(payload_remaining)
         if not payload and self.header.payload_len > 0:
             return None
-        self.buffer.commit()
+        self._stream_offset += self.buffer.commit()
+        payload_end = payload_start + len(payload)
 
         self.payload_consumed += len(payload)
         finished = self.payload_consumed == self.header.payload_len
@@ -388,7 +462,19 @@ class FrameDecoder:
                     final += result
             payload += final
 
-        frame = Frame(self.effective_opcode, bytes(payload), finished, self.header.fin)
+        source = FrameSource(
+            message_index=self._frame_message_index,
+            frame_index=self._frame_frame_index,
+            header_start=self._frame_header_start,
+            header_end=self._frame_header_end,
+            mask_start=self._frame_mask_start,
+            mask_end=self._frame_mask_end,
+            payload_start=payload_start,
+            payload_end=payload_end,
+        )
+        frame = Frame(
+            self.effective_opcode, bytes(payload), finished, self.header.fin, source,
+        )
 
         if finished:
             self.header = None
@@ -400,6 +486,7 @@ class FrameDecoder:
         return frame
 
     def parse_header(self) -> bool:
+        header_start = self._stream_offset + self.buffer.bytes_used
         data = self.buffer.consume_exactly(2)
         if data is None:
             self.buffer.rollback()
@@ -428,6 +515,7 @@ class FrameDecoder:
         if payload_len is None:
             self.buffer.rollback()
             return False
+        header_end = self._stream_offset + self.buffer.bytes_used
 
         self.extension_processing(opcode, rsv, payload_len)
 
@@ -442,11 +530,15 @@ class FrameDecoder:
             if masking_key is None:
                 self.buffer.rollback()
                 return False
+            mask_start: int | None = header_end
+            mask_end: int | None = self._stream_offset + self.buffer.bytes_used
             self.masker = XorMaskerSimple(masking_key)
         else:
+            mask_start = None
+            mask_end = None
             self.masker = XorMaskerNull()
 
-        self.buffer.commit()
+        self._stream_offset += self.buffer.commit()
         self.header = Header(fin, rsv, opcode, payload_len, None)
         self.effective_opcode = self.header.opcode
         if self.header.opcode.iscontrol():
@@ -454,6 +546,25 @@ class FrameDecoder:
         else:
             self.payload_required = 0
         self.payload_consumed = 0
+
+        if opcode.iscontrol():
+            # Control frames may be interleaved inside a fragmented message
+            # and must not disturb the message/frame numbering of it.
+            self._frame_message_index = self._message_index
+            self._frame_frame_index = self._frame_index
+        elif opcode is Opcode.CONTINUATION:
+            self._frame_index += 1
+            self._frame_message_index = self._message_index
+            self._frame_frame_index = self._frame_index
+        else:
+            self._message_index += 1
+            self._frame_index = 0
+            self._frame_message_index = self._message_index
+            self._frame_frame_index = self._frame_index
+        self._frame_header_start = header_start
+        self._frame_header_end = header_end
+        self._frame_mask_start = mask_start
+        self._frame_mask_end = mask_end
         return True
 
     def parse_extended_payload_length(
@@ -553,7 +664,10 @@ class FrameProtocol:
                 )
             data = (code, reason)
 
-        return Frame(frame.opcode, data, frame.frame_finished, frame.message_finished)
+        return Frame(
+            frame.opcode, data, frame.frame_finished, frame.message_finished,
+            frame.source,
+        )
 
     def _parse_more_gen(self) -> Generator[Frame | None, None, None]:
         # Consume as much as we can from self._buffer, yielding events, and
