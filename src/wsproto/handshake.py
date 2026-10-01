@@ -499,12 +499,29 @@ def client_extensions_handshake(
 ) -> list[Extension]:
     # This raises RemoteProtocolError is the accepted extension is not
     # supported.
+    strict = any(getattr(extension, "strict", False) for extension in supported)
     extensions = []
+    selected: set[str] = set()
     for accept in accepted:
         name = accept.split(";", 1)[0].strip()
+        if strict and name in selected:
+            msg = f"extension {name} was selected multiple times"
+            raise RemoteProtocolError(
+                msg, event_hint=RejectConnection(),
+            )
+        selected.add(name)
         for extension in supported:
             if extension.name == name:
-                extension.finalize(accept)
+                if strict:
+                    try:
+                        extension.finalize(accept)
+                    except ValueError as exc:
+                        msg = f"invalid parameters for extension {name}: {exc}"
+                        raise RemoteProtocolError(
+                            msg, event_hint=RejectConnection(),
+                        ) from exc
+                else:
+                    extension.finalize(accept)
                 extensions.append(extension)
                 break
         else:

@@ -4,7 +4,12 @@ import pytest
 
 from wsproto.connection import CLIENT, SERVER, ConnectionState
 from wsproto.events import AcceptConnection, Ping, Request
-from wsproto.handshake import H11Handshake
+from wsproto.extensions import PerMessageDeflate
+from wsproto.handshake import (
+    H11Handshake,
+    client_extensions_handshake,
+    server_extensions_handshake,
+)
 from wsproto.utilities import LocalProtocolError, RemoteProtocolError
 
 
@@ -102,3 +107,88 @@ def test_h11_multiple_headers_handshake() -> None:
         "this-extension; were-gonna-see",
         "and-another-extension; were-also; gonna-see=100; percent",
     ]
+
+
+def test_server_extensions_handshake_skips_invalid_strict_offers() -> None:
+    ext = PerMessageDeflate(strict=True)
+    requested = [
+        "permessage-deflate; server_max_window_bits=99",
+        "permessage-deflate; server_max_window_bits=10",
+    ]
+
+    accepts = server_extensions_handshake(requested, [ext])
+
+    assert accepts == b"permessage-deflate; server_max_window_bits=10"
+    assert ext.server_max_window_bits == 10
+
+
+def test_server_extensions_handshake_offer_order_does_not_matter() -> None:
+    valid = "permessage-deflate; client_no_context_takeover; server_max_window_bits=10"
+    invalid = "permessage-deflate; client_max_window_bits=99; server_no_context_takeover"
+
+    results = []
+    for requested in ([invalid, valid], [valid, invalid]):
+        ext = PerMessageDeflate(strict=True)
+        accepts = server_extensions_handshake(requested, [ext])
+        results.append(
+            (
+                accepts,
+                ext.client_no_context_takeover,
+                ext.server_no_context_takeover,
+                ext.client_max_window_bits,
+                ext.server_max_window_bits,
+            ),
+        )
+
+    assert results[0] == results[1]
+    assert results[0][0] == (
+        b"permessage-deflate; client_no_context_takeover; server_max_window_bits=10"
+    )
+
+
+def test_server_extensions_handshake_compat_mode_is_lenient() -> None:
+    ext = PerMessageDeflate()
+
+    accepts = server_extensions_handshake(
+        ["permessage-deflate; made_up_parameter; server_max_window_bits=10"],
+        [ext],
+    )
+
+    assert accepts == b"permessage-deflate; server_max_window_bits=10"
+
+
+def test_client_extensions_handshake_rejects_duplicate_selection() -> None:
+    ext = PerMessageDeflate(strict=True)
+
+    with pytest.raises(RemoteProtocolError, match="multiple times"):
+        client_extensions_handshake(
+            ["permessage-deflate", "permessage-deflate"], [ext],
+        )
+
+
+def test_client_extensions_handshake_compat_allows_duplicate_selection() -> None:
+    ext = PerMessageDeflate()
+
+    extensions = client_extensions_handshake(
+        ["permessage-deflate", "permessage-deflate"], [ext],
+    )
+
+    assert extensions == [ext, ext]
+
+
+def test_client_extensions_handshake_rejects_unknown_extension() -> None:
+    ext = PerMessageDeflate(strict=True)
+
+    with pytest.raises(RemoteProtocolError, match="unrecognized extension"):
+        client_extensions_handshake(["x-unknown-ext; a=1"], [ext])
+
+
+def test_client_extensions_handshake_rejects_unoffered_parameters() -> None:
+    ext = PerMessageDeflate(strict=True)
+
+    with pytest.raises(RemoteProtocolError, match="client_no_context_takeover"):
+        client_extensions_handshake(
+            ["permessage-deflate; client_no_context_takeover"], [ext],
+        )
+
+    assert not ext.enabled()

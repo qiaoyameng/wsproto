@@ -6,6 +6,16 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Add a strict extension negotiation mode via
+  ``PerMessageDeflate(strict=True)``. In strict mode each
+  permessage-deflate offer is validated (parameter names, duplicates,
+  empty values and window bits ranges), invalid offers are skipped
+  without mutating the extension instance, and the client rejects
+  responses that select an extension multiple times or include
+  parameters that were not offered. ``PerMessageDeflate.rejection_reason``
+  explains which negotiation constraint was not met. Extension
+  negotiation is also atomic in the default lenient mode: a failed
+  ``accept`` no longer alters the extension's state.
 
 1.3.2 (2025-11-20)
 ------------------

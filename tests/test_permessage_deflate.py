@@ -501,3 +501,139 @@ class TestPerMessageDeflate:
     def test_repr(self, params: Params) -> None:
         ext = wpext.PerMessageDeflate(**params)
         self.compare_params_to_string(params, ext, repr(ext))
+
+
+class TestPerMessageDeflateStrict:
+    @pytest.mark.parametrize(
+        "offer,reason",
+        [
+            ("permessage-deflate; unknown_thing=1", "unknown extension parameter"),
+            (
+                "permessage-deflate; server_max_window_bits=10; server_max_window_bits=11",
+                "duplicate extension parameter",
+            ),
+            (
+                "permessage-deflate; client_no_context_takeover=yes",
+                "must not have a value",
+            ),
+            (
+                "permessage-deflate; server_max_window_bits",
+                "requires a value",
+            ),
+            (
+                "permessage-deflate; client_max_window_bits=",
+                "has an empty value",
+            ),
+            (
+                "permessage-deflate; client_max_window_bits=lots",
+                "is not an integer",
+            ),
+            (
+                "permessage-deflate; client_max_window_bits=16",
+                "out of range",
+            ),
+            (
+                "permessage-deflate; server_max_window_bits=8",
+                "out of range",
+            ),
+            ("permessage-deflate; ", "empty extension parameter"),
+        ],
+    )
+    def test_accept_rejects_invalid_offers(self, offer: str, reason: str) -> None:
+        ext = wpext.PerMessageDeflate(strict=True)
+
+        assert ext.accept(offer) is None
+        assert reason in str(ext.rejection_reason)
+
+    def test_failed_accept_does_not_mutate_state(self) -> None:
+        ext = wpext.PerMessageDeflate(strict=True)
+
+        # The invalid window bits appear after an otherwise valid parameter.
+        result = ext.accept(
+            "permessage-deflate; client_no_context_takeover; server_max_window_bits=99",
+        )
+
+        assert result is None
+        assert not ext.enabled()
+        assert not ext.client_no_context_takeover
+        assert not ext.server_no_context_takeover
+        assert ext.client_max_window_bits == 15
+        assert ext.server_max_window_bits == 15
+        assert "out of range" in str(ext.rejection_reason)
+
+    def test_accept_valid_offer(self) -> None:
+        ext = wpext.PerMessageDeflate(strict=True)
+
+        response = ext.accept(
+            "permessage-deflate; client_max_window_bits; server_max_window_bits=10",
+        )
+
+        assert response == "client_max_window_bits=15; server_max_window_bits=10"
+        assert ext.enabled()
+        assert ext.rejection_reason is None
+
+    def test_failed_accept_then_valid_offer(self) -> None:
+        ext = wpext.PerMessageDeflate(strict=True)
+
+        assert ext.accept("permessage-deflate; server_max_window_bits=99") is None
+        response = ext.accept("permessage-deflate; server_max_window_bits=10")
+
+        assert response == "server_max_window_bits=10"
+        assert ext.server_max_window_bits == 10
+        assert ext.rejection_reason is None
+
+    def test_finalize_valid_response(self) -> None:
+        ext = wpext.PerMessageDeflate(client_no_context_takeover=True, strict=True)
+
+        ext.finalize(
+            "permessage-deflate; client_no_context_takeover; "
+            "server_no_context_takeover; client_max_window_bits=10; "
+            "server_max_window_bits=12",
+        )
+
+        assert ext.enabled()
+        assert ext.client_no_context_takeover
+        assert ext.server_no_context_takeover
+        assert ext.client_max_window_bits == 10
+        assert ext.server_max_window_bits == 12
+
+    def test_finalize_rejects_unoffered_client_no_context_takeover(self) -> None:
+        ext = wpext.PerMessageDeflate(strict=True)
+
+        with pytest.raises(ValueError, match="client_no_context_takeover"):
+            ext.finalize("permessage-deflate; client_no_context_takeover")
+
+        assert not ext.enabled()
+        assert "not offered" in str(ext.rejection_reason)
+
+    def test_finalize_allows_unoffered_server_no_context_takeover(self) -> None:
+        ext = wpext.PerMessageDeflate(strict=True)
+
+        ext.finalize("permessage-deflate; server_no_context_takeover")
+
+        assert ext.enabled()
+        assert ext.server_no_context_takeover
+
+    @pytest.mark.parametrize(
+        "response,reason",
+        [
+            ("permessage-deflate; made_up_param", "unknown extension parameter"),
+            (
+                "permessage-deflate; server_max_window_bits=10; server_max_window_bits=10",
+                "duplicate extension parameter",
+            ),
+            ("permessage-deflate; client_max_window_bits", "requires a value"),
+            ("permessage-deflate; server_max_window_bits=", "has an empty value"),
+            ("permessage-deflate; server_max_window_bits=99", "out of range"),
+        ],
+    )
+    def test_finalize_rejects_invalid_responses(
+        self, response: str, reason: str,
+    ) -> None:
+        ext = wpext.PerMessageDeflate(strict=True)
+
+        with pytest.raises(ValueError, match=reason):
+            ext.finalize(response)
+
+        assert not ext.enabled()
+        assert reason in str(ext.rejection_reason)

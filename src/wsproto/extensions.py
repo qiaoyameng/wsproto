@@ -65,12 +65,20 @@ class PerMessageDeflate(Extension):
     DEFAULT_CLIENT_MAX_WINDOW_BITS = 15
     DEFAULT_SERVER_MAX_WINDOW_BITS = 15
 
+    _PARAMETER_NAMES = (
+        "client_no_context_takeover",
+        "server_no_context_takeover",
+        "client_max_window_bits",
+        "server_max_window_bits",
+    )
+
     def __init__(
         self,
         client_no_context_takeover: bool = False,
         client_max_window_bits: int | None = None,
         server_no_context_takeover: bool = False,
         server_max_window_bits: int | None = None,
+        strict: bool = False,
     ) -> None:
         self.client_no_context_takeover = client_no_context_takeover
         self.server_no_context_takeover = server_no_context_takeover
@@ -91,6 +99,15 @@ class PerMessageDeflate(Extension):
         self._inbound_compressed: bool | None = None
 
         self._enabled = False
+
+        #: Strictly validate extension parameters during negotiation. In
+        #: strict mode invalid offers are rejected without mutating this
+        #: instance and :attr:`rejection_reason` explains which negotiation
+        #: constraint was not met. The default (``False``) keeps the
+        #: historical lenient behaviour.
+        self.strict = strict
+        #: Why the last strict negotiation attempt failed, if it did.
+        self.rejection_reason: str | None = None
 
     @property
     def client_max_window_bits(self) -> int:
@@ -134,6 +151,34 @@ class PerMessageDeflate(Extension):
         return "; ".join(parameters)
 
     def finalize(self, offer: str) -> None:
+        if self.strict:
+            try:
+                parsed = self._strict_parse(offer, response=True)
+                if (
+                    parsed["client_no_context_takeover"]
+                    and not self.client_no_context_takeover
+                ):
+                    msg = (
+                        "server selected client_no_context_takeover, "
+                        "which was not offered"
+                    )
+                    raise ValueError(msg)
+            except ValueError as exc:
+                self.rejection_reason = str(exc)
+                raise
+            self.client_no_context_takeover = bool(
+                self.client_no_context_takeover or parsed["client_no_context_takeover"]
+            )
+            self.server_no_context_takeover = bool(
+                self.server_no_context_takeover or parsed["server_no_context_takeover"]
+            )
+            if parsed["client_max_window_bits"] is not None:
+                self.client_max_window_bits = parsed["client_max_window_bits"]
+            if parsed["server_max_window_bits"] is not None:
+                self.server_max_window_bits = parsed["server_max_window_bits"]
+            self._enabled = True
+            return
+
         bits = [b.strip() for b in offer.split(";")]
         for bit in bits[1:]:
             if bit.startswith("client_no_context_takeover"):
@@ -147,37 +192,122 @@ class PerMessageDeflate(Extension):
 
         self._enabled = True
 
-    def _parse_params(self, params: str) -> tuple[int | None, int | None]:
-        client_max_window_bits = None
-        server_max_window_bits = None
-
+    def _compat_parse(self, params: str) -> dict[str, bool | int | None]:
+        # Lenient parsing, kept for backwards compatibility. Unknown
+        # parameters are ignored and values are matched by prefix. This
+        # does not mutate the instance; it may still raise ValueError for
+        # non-integer window bits values, as the historical code did.
+        parsed: dict[str, bool | int | None] = {
+            "client_no_context_takeover": False,
+            "server_no_context_takeover": False,
+            "client_max_window_bits": None,
+            "server_max_window_bits": None,
+        }
         bits = [b.strip() for b in params.split(";")]
         for bit in bits[1:]:
             if bit.startswith("client_no_context_takeover"):
-                self.client_no_context_takeover = True
+                parsed["client_no_context_takeover"] = True
             elif bit.startswith("server_no_context_takeover"):
-                self.server_no_context_takeover = True
+                parsed["server_no_context_takeover"] = True
             elif bit.startswith("client_max_window_bits"):
                 if "=" in bit:
-                    client_max_window_bits = int(bit.split("=", 1)[1].strip())
+                    parsed["client_max_window_bits"] = int(bit.split("=", 1)[1].strip())
                 else:
-                    client_max_window_bits = self.client_max_window_bits
+                    parsed["client_max_window_bits"] = self.client_max_window_bits
             elif bit.startswith("server_max_window_bits"):
                 if "=" in bit:
-                    server_max_window_bits = int(bit.split("=", 1)[1].strip())
+                    parsed["server_max_window_bits"] = int(bit.split("=", 1)[1].strip())
                 else:
-                    server_max_window_bits = self.server_max_window_bits
+                    parsed["server_max_window_bits"] = self.server_max_window_bits
 
-        return client_max_window_bits, server_max_window_bits
+        return parsed
+
+    def _strict_parse(
+        self, params: str, response: bool,
+    ) -> dict[str, bool | int | None]:
+        # Validate a single offer/response, raising ValueError describing
+        # the unmet negotiation constraint. This never mutates the
+        # instance, so a failed negotiation attempt leaves no trace.
+        parsed: dict[str, bool | int | None] = {
+            "client_no_context_takeover": False,
+            "server_no_context_takeover": False,
+            "client_max_window_bits": None,
+            "server_max_window_bits": None,
+        }
+        seen: set[str] = set()
+        bits = params.split(";")
+        for bit in bits[1:]:
+            bit = bit.strip()
+            if not bit:
+                msg = "empty extension parameter"
+                raise ValueError(msg)
+            name, has_value, value = bit.partition("=")
+            name = name.strip()
+            value = value.strip()
+            if name not in self._PARAMETER_NAMES:
+                msg = f"unknown extension parameter {name!r}"
+                raise ValueError(msg)
+            if name in seen:
+                msg = f"duplicate extension parameter {name!r}"
+                raise ValueError(msg)
+            seen.add(name)
+            if name.endswith("no_context_takeover"):
+                if has_value:
+                    msg = f"extension parameter {name!r} must not have a value"
+                    raise ValueError(msg)
+                parsed[name] = True
+            elif not has_value:
+                # A valueless client_max_window_bits is only valid in an
+                # offer, where it indicates support without a preference.
+                if name == "client_max_window_bits" and not response:
+                    parsed[name] = self.client_max_window_bits
+                else:
+                    msg = f"extension parameter {name!r} requires a value"
+                    raise ValueError(msg)
+            elif not value:
+                msg = f"extension parameter {name!r} has an empty value"
+                raise ValueError(msg)
+            else:
+                try:
+                    window_bits = int(value)
+                except ValueError:
+                    msg = f"extension parameter {name!r} value {value!r} is not an integer"
+                    raise ValueError(msg) from None
+                if not 9 <= window_bits <= 15:
+                    msg = (
+                        f"extension parameter {name!r} value {window_bits} "
+                        "is out of range (9-15)"
+                    )
+                    raise ValueError(msg)
+                parsed[name] = window_bits
+
+        return parsed
 
     def accept(self, offer: str) -> bool | None | str:
-        client_max_window_bits, server_max_window_bits = self._parse_params(offer)
+        self.rejection_reason = None
+        if self.strict:
+            try:
+                parsed = self._strict_parse(offer, response=False)
+            except ValueError as exc:
+                self.rejection_reason = str(exc)
+                return None
+        else:
+            parsed = self._compat_parse(offer)
+
+        client_no_context_takeover = bool(
+            self.client_no_context_takeover or parsed["client_no_context_takeover"]
+        )
+        server_no_context_takeover = bool(
+            self.server_no_context_takeover or parsed["server_no_context_takeover"]
+        )
+        client_max_window_bits = parsed["client_max_window_bits"]
+        server_max_window_bits = parsed["server_max_window_bits"]
 
         parameters = []
 
-        if self.client_no_context_takeover:
+        if client_no_context_takeover:
             parameters.append("client_no_context_takeover")
-        if self.server_no_context_takeover:
+        if server_no_context_takeover:
             parameters.append("server_no_context_takeover")
         try:
             if client_max_window_bits is not None:
@@ -189,6 +319,8 @@ class PerMessageDeflate(Extension):
         except ValueError:
             return None
         else:
+            self.client_no_context_takeover = client_no_context_takeover
+            self.server_no_context_takeover = server_no_context_takeover
             self._enabled = True
             return "; ".join(parameters)
 
