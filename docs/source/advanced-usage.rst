@@ -70,6 +70,29 @@ directly.
     for event in connection.events():
         # As with WSConnection, only without any handshake events
 
+Outbound frame size
+-------------------
+
+Pass ``max_frame_payload`` when creating a connection to limit the payload
+length of each outbound WebSocket data frame:
+
+.. code-block:: python
+
+    connection = Connection(
+        ConnectionType.SERVER,
+        extensions,
+        max_frame_payload=4096,
+    )
+
+When the payload produced for a ``Message`` event is larger than the limit,
+``send`` emits the original data opcode in the first frame and continuation
+opcodes in the remaining frames. Fragments supplied by the application with
+``message_finished=False`` are kept open; only the fragment with
+``message_finished=True`` can produce a final frame. Empty messages still
+produce an explicit frame. The limit applies to the wire payload after
+extensions have processed it, so compression, RSV bits, and the final flush
+remain valid. Control frames are not fragmented.
+
 HTTP/2
 ------
 

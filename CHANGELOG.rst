@@ -6,6 +6,9 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Add ``max_frame_payload`` to split outbound data messages into legal
+  continuation frames while preserving extensions and application message
+  boundaries.
 
 1.3.2 (2025-11-20)
 ------------------

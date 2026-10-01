@@ -25,15 +25,24 @@ class WSConnection:
     Represents the local end of a WebSocket connection to a remote peer.
     """
 
-    def __init__(self, connection_type: ConnectionType) -> None:
+    def __init__(
+        self,
+        connection_type: ConnectionType,
+        max_frame_payload: int | None = None,
+    ) -> None:
         """
         Constructor
 
         :param wsproto.connection.ConnectionType connection_type: Controls
             whether the library behaves as a client or as a server.
+        :param int max_frame_payload: Maximum payload length for outbound data
+            frames. Larger message fragments are split into continuation frames.
         """
         self.client = connection_type is ConnectionType.CLIENT
-        self.handshake = H11Handshake(connection_type)
+        self.handshake = H11Handshake(
+            connection_type,
+            max_frame_payload=max_frame_payload,
+        )
         self.connection: Connection | None = None
 
     @property

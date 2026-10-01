@@ -509,9 +509,20 @@ class FrameDecoder:
 
 
 class FrameProtocol:
-    def __init__(self, client: bool, extensions: list[Extension]) -> None:
+    def __init__(
+        self,
+        client: bool,
+        extensions: list[Extension],
+        max_frame_payload: int | None = None,
+    ) -> None:
         self.client = client
         self.extensions = [ext for ext in extensions if ext.enabled()]
+        if max_frame_payload is not None and not (
+            1 <= max_frame_payload <= MAX_FRAME_PAYLOAD
+        ):
+            msg = "max_frame_payload must be between 1 and MAX_FRAME_PAYLOAD"
+            raise ValueError(msg)
+        self.max_frame_payload = max_frame_payload
 
         # Global state
         self._frame_decoder = FrameDecoder(self.client, self.extensions)
@@ -630,10 +641,43 @@ class FrameProtocol:
         else:
             opcode = Opcode.CONTINUATION
 
-        if fin:
+        message_finished = fin
+        if message_finished:
             self._outbound_opcode = None
 
-        return self._serialize_frame(opcode, payload, fin)
+        rsv = RsvBits(False, False, False)
+        for extension in reversed(self.extensions):
+            rsv, payload = extension.frame_outbound(
+                self, opcode, rsv, bytes(payload), message_finished,
+            )
+
+        return self._serialize_data_frames(opcode, payload, message_finished, rsv)
+
+    def _serialize_data_frames(
+        self,
+        opcode: Opcode,
+        payload: bytes | bytearray,
+        fin: bool,
+        rsv: RsvBits,
+    ) -> bytearray:
+        payload = bytearray(payload)
+        if self.max_frame_payload is None or len(payload) <= self.max_frame_payload:
+            return self._build_frame(opcode, payload, fin, rsv)
+
+        frames = bytearray()
+        first_frame = True
+        while payload:
+            frame_payload = payload[: self.max_frame_payload]
+            payload = payload[self.max_frame_payload :]
+            frame_finished = fin and not payload
+            frame_opcode = opcode if first_frame else Opcode.CONTINUATION
+            frame_rsv = rsv if first_frame else RsvBits(False, False, False)
+            frames += self._build_frame(
+                frame_opcode, frame_payload, frame_finished, frame_rsv,
+            )
+            first_frame = False
+
+        return frames
 
     def _make_fin_rsv_opcode(self, fin: bool, rsv: RsvBits, opcode: Opcode) -> int:
         fin_bits = int(fin) << 7
@@ -649,8 +693,28 @@ class FrameProtocol:
 
         rsv = RsvBits(False, False, False)
         for extension in reversed(self.extensions):
-            rsv, payload = extension.frame_outbound(self, opcode, rsv, bytes(payload), fin)
+            rsv, payload = extension.frame_outbound(
+                self, opcode, rsv, bytes(payload), fin,
+            )
 
+        if (
+            opcode.iscontrol()
+            and self.max_frame_payload is not None
+            and len(payload) > self.max_frame_payload
+        ):
+            msg = "payload too long for control frame"
+            raise ValueError(msg)
+
+        return self._build_frame(opcode, payload, fin, rsv)
+
+    def _build_frame(
+        self,
+        opcode: Opcode,
+        payload: bytes | bytearray,
+        fin: bool,
+        rsv: RsvBits,
+    ) -> bytearray:
+        payload = bytearray(payload)
         fin_rsv_opcode = self._make_fin_rsv_opcode(fin, rsv, opcode)
 
         payload_length = len(payload)
