@@ -509,9 +509,18 @@ class FrameDecoder:
 
 
 class FrameProtocol:
-    def __init__(self, client: bool, extensions: list[Extension]) -> None:
+    def __init__(
+        self,
+        client: bool,
+        extensions: list[Extension],
+        max_frame_payload_size: int | None = None,
+    ) -> None:
         self.client = client
         self.extensions = [ext for ext in extensions if ext.enabled()]
+        if max_frame_payload_size is not None and max_frame_payload_size < 1:
+            msg = "max_frame_payload_size must be at least 1"
+            raise ValueError(msg)
+        self._max_frame_payload_size = max_frame_payload_size
 
         # Global state
         self._frame_decoder = FrameDecoder(self.client, self.extensions)
@@ -633,7 +642,36 @@ class FrameProtocol:
         if fin:
             self._outbound_opcode = None
 
-        return self._serialize_frame(opcode, payload, fin)
+        payload = bytearray(payload)
+        rsv = RsvBits(False, False, False)
+        for extension in reversed(self.extensions):
+            rsv, payload = extension.frame_outbound(
+                self, opcode, rsv, bytes(payload), fin,
+            )
+
+        max_size = self._max_frame_payload_size
+        if max_size is None or len(payload) <= max_size:
+            return self._serialize_single_frame(opcode, rsv, payload, fin)
+
+        # The (possibly extension-transformed) payload exceeds the outbound
+        # frame payload limit, so split it over multiple frames. The first
+        # frame carries the message opcode and any extension RSV bits, the
+        # remaining frames are continuations, and only the final frame may
+        # carry the FIN bit (and only if this send finishes the message).
+        frames = bytearray()
+        chunks = [
+            payload[index : index + max_size]
+            for index in range(0, len(payload), max_size)
+        ]
+        for index, chunk in enumerate(chunks):
+            frame_fin = fin and index == len(chunks) - 1
+            if index == 0:
+                frames += self._serialize_single_frame(opcode, rsv, chunk, frame_fin)
+            else:
+                frames += self._serialize_single_frame(
+                    Opcode.CONTINUATION, RsvBits(False, False, False), chunk, frame_fin,
+                )
+        return frames
 
     def _make_fin_rsv_opcode(self, fin: bool, rsv: RsvBits, opcode: Opcode) -> int:
         fin_bits = int(fin) << 7
@@ -651,6 +689,15 @@ class FrameProtocol:
         for extension in reversed(self.extensions):
             rsv, payload = extension.frame_outbound(self, opcode, rsv, bytes(payload), fin)
 
+        return self._serialize_single_frame(opcode, rsv, payload, fin)
+
+    def _serialize_single_frame(
+        self,
+        opcode: Opcode,
+        rsv: RsvBits,
+        payload: bytes | bytearray,
+        fin: bool,
+    ) -> bytearray:
         fin_rsv_opcode = self._make_fin_rsv_opcode(fin, rsv, opcode)
 
         payload_length = len(payload)

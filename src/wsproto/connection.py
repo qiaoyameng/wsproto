@@ -75,6 +75,7 @@ class Connection:
         connection_type: ConnectionType,
         extensions: list[Extension] | None = None,
         trailing_data: bytes = b"",
+        max_frame_payload_size: int | None = None,
     ) -> None:
         """
         Constructor
@@ -85,10 +86,16 @@ class Connection:
         :param list extensions: The proposed extensions.
         :param bytes trailing_data: Data that has been received, but not yet
             processed.
+        :param int max_frame_payload_size: The maximum payload size, in bytes,
+            of any outbound data frame. Larger message payloads are split over
+            multiple continuation frames. ``None`` (the default) disables the
+            limit. Control frames are never split.
         """
         self.client = connection_type is ConnectionType.CLIENT
         self._events: deque[Event] = deque()
-        self._proto = FrameProtocol(self.client, extensions or [])
+        self._proto = FrameProtocol(
+            self.client, extensions or [], max_frame_payload_size,
+        )
         self._state = ConnectionState.OPEN
         self.receive_data(trailing_data)
 

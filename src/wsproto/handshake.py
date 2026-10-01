@@ -41,9 +41,14 @@ WEBSOCKET_UPGRADE = b"websocket"
 class H11Handshake:
     """A Handshake implementation for HTTP/1.1 connections."""
 
-    def __init__(self, connection_type: ConnectionType) -> None:
+    def __init__(
+        self,
+        connection_type: ConnectionType,
+        max_frame_payload_size: int | None = None,
+    ) -> None:
         self.client = connection_type is ConnectionType.CLIENT
         self._state = ConnectionState.CONNECTING
+        self._max_frame_payload_size = max_frame_payload_size
 
         if self.client:
             self._h11_connection = h11.Connection(h11.CLIENT)
@@ -305,6 +310,7 @@ class H11Handshake:
         self._connection = Connection(
             ConnectionType.CLIENT if self.client else ConnectionType.SERVER,
             event.extensions,
+            max_frame_payload_size=self._max_frame_payload_size,
         )
         self._state = ConnectionState.OPEN
         return self._h11_connection.send(response) or b""
@@ -448,6 +454,7 @@ class H11Handshake:
             ConnectionType.CLIENT if self.client else ConnectionType.SERVER,
             extensions,
             self._h11_connection.trailing_data[0],
+            max_frame_payload_size=self._max_frame_payload_size,
         )
         self._state = ConnectionState.OPEN
         return AcceptConnection(

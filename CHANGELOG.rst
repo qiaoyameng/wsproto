@@ -4,6 +4,11 @@ Release History
 1.4.0 (unreleased)
 ------------------
 
+- Add optional ``max_frame_payload_size`` to ``Connection`` (and
+  ``WSConnection``) to split large outbound messages into continuation
+  frames whose payloads do not exceed the given limit. The limit applies
+  to the on-wire payload (after extensions such as permessage-deflate),
+  and control frames are never split.
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
 
