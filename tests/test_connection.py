@@ -15,6 +15,17 @@ from wsproto.frame_protocol import CloseReason
 from wsproto.utilities import LocalProtocolError
 
 
+def data_frame(
+    opcode: int,
+    payload: bytes,
+    *,
+    fin: bool = True,
+    compressed: bool = False,
+) -> bytes:
+    first_byte = (0x80 if fin else 0x00) | (0x40 if compressed else 0x00) | opcode
+    return bytes([first_byte, len(payload)]) + payload
+
+
 @pytest.mark.parametrize("client_sends", [True, False])
 @pytest.mark.parametrize("final", [True, False])
 def test_send_message(client_sends: bool, final: bool) -> None:
@@ -169,3 +180,77 @@ def test_receive_data_when_closed() -> None:
     client._state = ConnectionState.CLOSED
     with pytest.raises(LocalProtocolError):
         client.receive_data(b"something")
+
+
+def test_invalid_max_message_size() -> None:
+    with pytest.raises(ValueError, match="non-negative integer"):
+        Connection(CLIENT, max_message_size=-1)
+
+
+def test_max_message_size_continuation_and_control_frames() -> None:
+    client = Connection(CLIENT, max_message_size=4)
+    frames = (
+        data_frame(2, b"ab", fin=False)
+        + data_frame(9, b"p")
+        + data_frame(0, b"c", fin=False)
+        + data_frame(10, b"q")
+        + data_frame(0, b"de")
+    )
+
+    client.receive_data(frames)
+    events = list(client.events())
+
+    assert [type(event) for event in events] == [
+        BytesMessage,
+        Ping,
+        BytesMessage,
+        Pong,
+        CloseConnection,
+    ]
+    assert events[0].data == b"ab"
+    assert events[2].data == b"c"
+    assert events[4].code is CloseReason.MESSAGE_TOO_BIG
+
+
+def test_max_message_size_accepts_exact_continuation_size() -> None:
+    client = Connection(CLIENT, max_message_size=5)
+    frames = (
+        data_frame(2, b"abc", fin=False)
+        + data_frame(9, b"p")
+        + data_frame(0, b"de")
+    )
+
+    client.receive_data(frames)
+    events = list(client.events())
+
+    assert [type(event) for event in events] == [BytesMessage, Ping, BytesMessage]
+    assert events[0].data == b"abc"
+    assert events[2].data == b"de"
+
+
+def test_max_message_size_counts_text_bytes_across_network_chunks() -> None:
+    payload = "∂".encode("utf-8")
+
+    accepted = Connection(CLIENT, max_message_size=3)
+    for chunk in (bytes([byte]) for byte in b"\x81\x03" + payload):
+        accepted.receive_data(chunk)
+    events = list(accepted.events())
+    assert events == [TextMessage(data="∂")]
+
+    fragmented = Connection(CLIENT, max_message_size=3)
+    fragmented.receive_data(data_frame(1, payload[:1], fin=False))
+    fragmented.receive_data(data_frame(0, payload[1:]))
+    assert list(fragmented.events()) == [
+        TextMessage(data="", message_finished=False),
+        TextMessage(data="∂"),
+    ]
+
+    rejected = Connection(CLIENT, max_message_size=2)
+    rejected.receive_data(data_frame(1, payload[:1], fin=False))
+    assert list(rejected.events()) == [TextMessage(data="", message_finished=False)]
+    assert rejected._proto._frame_decoder.message_size == 1
+    rejected.receive_data(data_frame(0, payload[1:]))
+    events = list(rejected.events())
+
+    assert [type(event) for event in events] == [CloseConnection]
+    assert events[0].code is CloseReason.MESSAGE_TOO_BIG

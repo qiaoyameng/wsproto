@@ -195,6 +195,20 @@ data and then tear down the underlying connection.
     Both client and server connections must remember to reply to
     ``CloseConnection`` events initiated by the remote party.
 
+Message Size Limits
+-------------------
+
+Pass ``max_message_size`` when constructing a connection to limit received
+messages by their decompressed size. Continuation frames belonging to a
+message share the limit, while ping and pong frames do not reset it. Text is
+counted as UTF-8 bytes. When a message exceeds the limit, wsproto emits a
+``CloseConnection`` event with status code 1009 and does not deliver further
+data from that message.
+
+.. code-block:: python
+
+    ws = WSConnection(ConnectionType.CLIENT, max_message_size=1_048_576)
+
 Ping Pong
 ---------
 

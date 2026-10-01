@@ -25,15 +25,29 @@ class WSConnection:
     Represents the local end of a WebSocket connection to a remote peer.
     """
 
-    def __init__(self, connection_type: ConnectionType) -> None:
+    def __init__(
+        self,
+        connection_type: ConnectionType,
+        max_message_size: int | None = None,
+    ) -> None:
         """
         Constructor
 
         :param wsproto.connection.ConnectionType connection_type: Controls
             whether the library behaves as a client or as a server.
+        :param int max_message_size: Maximum number of decompressed bytes
+            allowed in one received message, or ``None`` for no limit.
         """
+        if max_message_size is not None and (
+            not isinstance(max_message_size, int)
+            or isinstance(max_message_size, bool)
+            or max_message_size < 0
+        ):
+            msg = "max_message_size must be a non-negative integer or None"
+            raise ValueError(msg)
+
         self.client = connection_type is ConnectionType.CLIENT
-        self.handshake = H11Handshake(connection_type)
+        self.handshake = H11Handshake(connection_type, max_message_size)
         self.connection: Connection | None = None
 
     @property

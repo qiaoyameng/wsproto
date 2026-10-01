@@ -43,6 +43,9 @@ class Extension(ABC):
     ) -> bytes | CloseReason:
         return data
 
+    def frame_inbound_pending(self, _proto: FrameDecoder | FrameProtocol) -> bool:
+        return False
+
     def frame_inbound_complete(
         self, proto: FrameDecoder | FrameProtocol, fin: bool,
     ) -> bytes | CloseReason | None:
@@ -89,8 +92,14 @@ class PerMessageDeflate(Extension):
         # frames). Only the first frame in a fragmented message is flagged for
         # compression, so this carries that bit forward.
         self._inbound_compressed: bool | None = None
+        self._inbound_unconsumed = b""
+        self._inbound_finalizing = False
+        self._inbound_terminator_sent = False
 
         self._enabled = False
+
+    def _new_decompressor(self, bits: int) -> zlib._Decompress:
+        return zlib.decompressobj(-int(bits))
 
     @property
     def client_max_window_bits(self) -> int:
@@ -215,7 +224,10 @@ class PerMessageDeflate(Extension):
                 else:
                     bits = self.client_max_window_bits
                 if self._decompressor is None:
-                    self._decompressor = zlib.decompressobj(-int(bits))
+                    self._decompressor = self._new_decompressor(bits)
+                    self._inbound_unconsumed = b""
+                    self._inbound_finalizing = False
+                    self._inbound_terminator_sent = False
 
         return RsvBits(True, False, False)
 
@@ -227,9 +239,22 @@ class PerMessageDeflate(Extension):
         assert self._decompressor is not None
 
         try:
-            return self._decompressor.decompress(bytes(data))
+            data = self._inbound_unconsumed + bytes(data)
+            self._inbound_unconsumed = b""
+            budget = proto.message_size_remaining()
+            if budget is None:
+                return self._decompressor.decompress(data)
+
+            output = self._decompressor.decompress(data, budget + 1)
+            self._inbound_unconsumed = bytes(
+                getattr(self._decompressor, "unconsumed_tail", b""),
+            )
+            return output
         except zlib.error:
             return CloseReason.INVALID_FRAME_PAYLOAD_DATA
+
+    def frame_inbound_pending(self, _proto: FrameDecoder | FrameProtocol) -> bool:
+        return bool(self._inbound_unconsumed) or self._inbound_finalizing
 
     def frame_inbound_complete(
         self, proto: FrameDecoder | FrameProtocol, fin: bool,
@@ -237,28 +262,80 @@ class PerMessageDeflate(Extension):
         if not fin:
             return None
         if not self._inbound_is_compressible:
-            self._inbound_compressed = None
+            if not self._inbound_compressed:
+                self._inbound_compressed = None
             return None
         if not self._inbound_compressed:
             self._inbound_compressed = None
             return None
         assert self._decompressor is not None
-
-        try:
-            data = self._decompressor.decompress(b"\x00\x00\xff\xff")
-            data += self._decompressor.flush()
-        except zlib.error:
-            return CloseReason.INVALID_FRAME_PAYLOAD_DATA
-
         if proto.client:
             no_context_takeover = self.server_no_context_takeover
         else:
             no_context_takeover = self.client_no_context_takeover
 
-        if no_context_takeover:
-            self._decompressor = None
+        self._inbound_finalizing = True
+
+        try:
+            budget = proto.message_size_remaining()
+            if self._inbound_unconsumed:
+                return b""
+
+            if not self._inbound_terminator_sent:
+                self._inbound_terminator_sent = True
+                if budget is None:
+                    data = self._decompressor.decompress(b"\x00\x00\xff\xff")
+                else:
+                    data = self._decompressor.decompress(b"\x00\x00\xff\xff", budget + 1)
+                self._inbound_unconsumed = bytes(
+                    getattr(self._decompressor, "unconsumed_tail", b""),
+                )
+                if not self._inbound_unconsumed and not data:
+                    self._inbound_terminator_sent = False
+                    if budget is None:
+                        data = self._decompressor.flush()
+                    else:
+                        data = self._decompressor.flush(budget + 1)
+                    if budget is None or len(data) <= budget:
+                        self._inbound_compressed = None
+                        self._inbound_unconsumed = b""
+                        self._inbound_terminator_sent = False
+                        self._inbound_finalizing = False
+                        if no_context_takeover:
+                            self._decompressor = None
+                        return data
+                return data
+
+            if self._inbound_terminator_sent:
+                if budget is None:
+                    data = self._decompressor.decompress(b"")
+                else:
+                    data = self._decompressor.decompress(b"", budget + 1)
+                self._inbound_unconsumed = bytes(
+                    getattr(self._decompressor, "unconsumed_tail", b""),
+                )
+                if not self._inbound_unconsumed:
+                    self._inbound_terminator_sent = False
+                if data or self._inbound_unconsumed:
+                    return data
+
+            if budget is None:
+                data = self._decompressor.flush()
+            else:
+                data = self._decompressor.flush(budget + 1)
+            if budget is not None and len(data) > budget:
+                return data
+        except zlib.error:
+            self._inbound_finalizing = False
+            return CloseReason.INVALID_FRAME_PAYLOAD_DATA
 
         self._inbound_compressed = None
+        self._inbound_unconsumed = b""
+        self._inbound_terminator_sent = False
+        self._inbound_finalizing = False
+
+        if no_context_takeover:
+            self._decompressor = None
 
         return data
 

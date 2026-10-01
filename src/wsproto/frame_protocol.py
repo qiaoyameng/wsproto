@@ -332,10 +332,15 @@ class MessageDecoder:
 
 class FrameDecoder:
     def __init__(
-        self, client: bool, extensions: list[Extension] | None = None,
+        self,
+        client: bool,
+        extensions: list[Extension] | None = None,
+        max_message_size: int | None = None,
     ) -> None:
         self.client = client
         self.extensions = extensions or []
+        self.max_message_size = max_message_size
+        self.message_size = 0
 
         self.buffer = Buffer()
 
@@ -345,28 +350,42 @@ class FrameDecoder:
         self.payload_required = 0
         self.payload_consumed = 0
 
+    @property
+    def extension_pending(self) -> bool:
+        return any(
+            extension.frame_inbound_pending(self) for extension in self.extensions
+        )
+
+    def message_size_remaining(self) -> int | None:
+        if self.max_message_size is None:
+            return None
+        return self.max_message_size - self.message_size
+
     def receive_bytes(self, data: bytes) -> None:
         self.buffer.feed(data)
 
     def process_buffer(self) -> Frame | None:
-        if not self.header and not self.parse_header():
+        if not self.header and not self.extension_pending and not self.parse_header():
             return None
         # parse_header() sets these.
         assert self.header is not None
         assert self.masker is not None
         assert self.effective_opcode is not None
 
-        if len(self.buffer) < self.payload_required:
+        if not self.extension_pending and len(self.buffer) < self.payload_required:
             return None
 
         payload_remaining = self.header.payload_len - self.payload_consumed
         payload = self.buffer.consume_at_most(payload_remaining)
         if not payload and self.header.payload_len > 0:
-            return None
-        self.buffer.commit()
+            if not self.extension_pending:
+                return None
+        else:
+            self.buffer.commit()
 
-        self.payload_consumed += len(payload)
-        finished = self.payload_consumed == self.header.payload_len
+        if payload:
+            self.payload_consumed += len(payload)
+        network_finished = self.payload_consumed == self.header.payload_len
 
         payload = self.masker.process(payload)
 
@@ -377,7 +396,9 @@ class FrameDecoder:
                 raise ParseFailed(msg, payload_)
             payload = bytearray(payload_)
 
-        if finished:
+        extension_ready = not self.extension_pending
+
+        if network_finished:
             final = bytearray()
             for extension in self.extensions:
                 result = extension.frame_inbound_complete(self, self.header.fin)
@@ -387,13 +408,30 @@ class FrameDecoder:
                 if result is not None:
                     final += result
             payload += final
+            extension_ready = not self.extension_pending
 
-        frame = Frame(self.effective_opcode, bytes(payload), finished, self.header.fin)
+        finished = network_finished and extension_ready
+
+        if not self.header.opcode.iscontrol():
+            self.message_size += len(payload)
+            if (
+                self.max_message_size is not None
+                and self.message_size > self.max_message_size
+            ):
+                msg = "Message too big"
+                raise ParseFailed(msg, CloseReason.MESSAGE_TOO_BIG)
+
+        message_finished = self.header.fin
+        frame = Frame(
+            self.effective_opcode, bytes(payload), finished, message_finished,
+        )
 
         if finished:
             self.header = None
             self.effective_opcode = None
             self.masker = None
+            if not frame.opcode.iscontrol() and message_finished:
+                self.message_size = 0
         else:
             self.effective_opcode = Opcode.CONTINUATION
 
@@ -509,16 +547,26 @@ class FrameDecoder:
 
 
 class FrameProtocol:
-    def __init__(self, client: bool, extensions: list[Extension]) -> None:
+    def __init__(
+        self,
+        client: bool,
+        extensions: list[Extension],
+        max_message_size: int | None = None,
+    ) -> None:
         self.client = client
         self.extensions = [ext for ext in extensions if ext.enabled()]
 
         # Global state
-        self._frame_decoder = FrameDecoder(self.client, self.extensions)
+        self._frame_decoder = FrameDecoder(
+            self.client, self.extensions, max_message_size,
+        )
         self._message_decoder = MessageDecoder()
         self._parse_more = self._parse_more_gen()
 
         self._outbound_opcode: Opcode | None = None
+
+    def message_size_remaining(self) -> int | None:
+        return self._frame_decoder.message_size_remaining()
 
     def _process_close(self, frame: Frame) -> Frame:
         data = frame.payload

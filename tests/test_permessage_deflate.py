@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import zlib
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Optional, cast
@@ -20,6 +21,86 @@ if TYPE_CHECKING:
 
 else:
     Params = dict
+
+
+def frame_bytes(
+    opcode: int,
+    payload: bytes,
+    *,
+    fin: bool = True,
+    compressed: bool = False,
+    mask: bool = False,
+) -> bytes:
+    first_byte = (0x80 if fin else 0x00) | (0x40 if compressed else 0x00) | opcode
+    if mask:
+        masking_key = b"mask"
+        masked_payload = bytes(
+            byte ^ masking_key[index % len(masking_key)]
+            for index, byte in enumerate(payload)
+        )
+        mask_bit = 0x80
+    else:
+        masking_key = b""
+        masked_payload = payload
+        mask_bit = 0x00
+    if len(payload) <= 125:
+        header = bytes([first_byte, mask_bit | len(payload)])
+        return header + masking_key + masked_payload
+    length = struct.pack("!H", len(payload))
+    return bytes([first_byte, mask_bit | 0x7E]) + length + masking_key + masked_payload
+
+
+def compressed_message(parts: list[bytes]) -> list[bytes]:
+    compressor = zlib.compressobj(
+        zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15,
+    )
+    result = []
+    for index, part in enumerate(parts):
+        data = compressor.compress(part)
+        if index == len(parts) - 1:
+            data += compressor.flush(zlib.Z_SYNC_FLUSH)[:-4]
+        result.append(data)
+    return result
+
+
+class TrackedDecompressor:
+    def __init__(self, decompressor: zlib._Decompress) -> None:
+        self._decompressor = decompressor
+        self.peak_output = 0
+
+    def decompress(self, data: bytes, max_length: int | None = None) -> bytes:
+        if max_length is None:
+            output = self._decompressor.decompress(data)
+        else:
+            output = self._decompressor.decompress(data, max_length)
+        self.peak_output = max(self.peak_output, len(output))
+        return output
+
+    def flush(self, max_length: int | None = None) -> bytes:
+        if max_length is None:
+            output = self._decompressor.flush()
+        else:
+            output = self._decompressor.flush(max_length)
+        self.peak_output = max(self.peak_output, len(output))
+        return output
+
+    @property
+    def unconsumed_tail(self) -> bytes:
+        return self._decompressor.unconsumed_tail
+
+    @property
+    def unused_data(self) -> bytes:
+        return self._decompressor.unused_data
+
+
+class TrackedPerMessageDeflate(wpext.PerMessageDeflate):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tracked_decompressor: TrackedDecompressor | None = None
+
+    def _new_decompressor(self, bits: int) -> zlib._Decompress:
+        self.tracked_decompressor = TrackedDecompressor(super()._new_decompressor(bits))
+        return cast("zlib._Decompress", self.tracked_decompressor)
 
 
 class TestPerMessageDeflate:
@@ -260,6 +341,103 @@ class TestPerMessageDeflate:
         data2 = ext.frame_inbound_complete(proto, True)
         assert isinstance(data2, bytes)
         assert data + data2 == payload
+
+    @pytest.mark.parametrize("client", [True, False])
+    @pytest.mark.parametrize(
+        "max_message_size,expected_error",
+        [(22, True), (23, False), (24, False)],
+    )
+    def test_message_size_limit_uses_decompressed_size(
+        self, client: bool, max_message_size: int, expected_error: bool,
+    ) -> None:
+        payload = b"x" * 23
+        compressed_payload = b"\xaa\xa8\xc0\n\x00\x00"
+        ext = wpext.PerMessageDeflate()
+        ext._enabled = True
+        proto = fp.FrameProtocol(client=client, extensions=[ext], max_message_size=max_message_size)
+
+        proto.receive_bytes(
+            frame_bytes(
+                fp.Opcode.BINARY,
+                compressed_payload,
+                compressed=True,
+                mask=not client,
+            ),
+        )
+
+        if expected_error:
+            with pytest.raises(fp.ParseFailed) as excinfo:
+                list(proto.received_frames())
+            assert excinfo.value.code is fp.CloseReason.MESSAGE_TOO_BIG
+        else:
+            frames = list(proto.received_frames())
+            assert len(frames) == 1
+            assert frames[0].payload == payload
+
+    @pytest.mark.parametrize("client", [True, False])
+    @pytest.mark.parametrize("max_message_size", [None, 5, 6, 100])
+    def test_message_size_limit_spans_fragments_and_control_frame(
+        self, client: bool, max_message_size: int | None,
+    ) -> None:
+        first_payload, final_payload = compressed_message([b"abc", b"def"])
+        ext = wpext.PerMessageDeflate()
+        ext._enabled = True
+        proto = fp.FrameProtocol(
+            client=client,
+            extensions=[ext],
+            max_message_size=max_message_size,
+        )
+        frames = (
+            frame_bytes(
+                fp.Opcode.TEXT, first_payload, fin=False, compressed=True,
+                mask=not client,
+            )
+            + frame_bytes(
+                fp.Opcode.PING, b"p", mask=not client,
+            )
+            + frame_bytes(
+                fp.Opcode.CONTINUATION,
+                final_payload,
+                mask=not client,
+            )
+        )
+
+        proto.receive_bytes(frames)
+
+        if max_message_size == 5:
+            with pytest.raises(fp.ParseFailed) as excinfo:
+                list(proto.received_frames())
+            assert excinfo.value.code is fp.CloseReason.MESSAGE_TOO_BIG
+        else:
+            frames = list(proto.received_frames())
+            assert [(frame.opcode, frame.payload) for frame in frames] == [
+                (fp.Opcode.TEXT, ""),
+                (fp.Opcode.PING, b"p"),
+                (fp.Opcode.TEXT, "abcdef"),
+            ]
+
+    @pytest.mark.parametrize("uncompressed_size", [4096, 16 * 1024 * 1024])
+    def test_message_size_limit_bounds_decompression(
+        self, uncompressed_size: int,
+    ) -> None:
+        compressed_payload = compressed_message([b"\0" * uncompressed_size])[0]
+        ext = TrackedPerMessageDeflate()
+        ext._enabled = True
+        proto = fp.FrameProtocol(
+            client=True, extensions=[ext], max_message_size=1024,
+        )
+
+        proto.receive_bytes(
+            frame_bytes(
+                fp.Opcode.BINARY, compressed_payload, compressed=True,
+            ),
+        )
+
+        with pytest.raises(fp.ParseFailed) as excinfo:
+            list(proto.received_frames())
+        assert excinfo.value.code is fp.CloseReason.MESSAGE_TOO_BIG
+        assert ext.tracked_decompressor is not None
+        assert ext.tracked_decompressor.peak_output <= 1025
 
     @pytest.mark.parametrize("client", [True, False])
     def test_client_inbound_compressed_multiple_data_frames(self, client: bool) -> None:

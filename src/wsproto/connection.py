@@ -75,6 +75,7 @@ class Connection:
         connection_type: ConnectionType,
         extensions: list[Extension] | None = None,
         trailing_data: bytes = b"",
+        max_message_size: int | None = None,
     ) -> None:
         """
         Constructor
@@ -85,10 +86,22 @@ class Connection:
         :param list extensions: The proposed extensions.
         :param bytes trailing_data: Data that has been received, but not yet
             processed.
+        :param int max_message_size: Maximum number of decompressed bytes
+            allowed in one received message, or ``None`` for no limit.
         """
+        if max_message_size is not None and (
+            not isinstance(max_message_size, int)
+            or isinstance(max_message_size, bool)
+            or max_message_size < 0
+        ):
+            msg = "max_message_size must be a non-negative integer or None"
+            raise ValueError(msg)
+
         self.client = connection_type is ConnectionType.CLIENT
         self._events: deque[Event] = deque()
-        self._proto = FrameProtocol(self.client, extensions or [])
+        self._proto = FrameProtocol(
+            self.client, extensions or [], max_message_size=max_message_size,
+        )
         self._state = ConnectionState.OPEN
         self.receive_data(trailing_data)
 

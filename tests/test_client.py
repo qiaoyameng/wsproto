@@ -9,6 +9,7 @@ from wsproto import WSConnection
 from wsproto.connection import CLIENT, ConnectionState
 from wsproto.events import (
     AcceptConnection,
+    CloseConnection,
     Event,
     RejectConnection,
     RejectData,
@@ -140,6 +141,11 @@ def test_connection_send_state() -> None:
     assert len(list(client.events())) == 1
 
 
+def test_invalid_max_message_size() -> None:
+    with pytest.raises(ValueError, match="non-negative integer"):
+        WSConnection(CLIENT, max_message_size=-1)
+
+
 def _make_handshake(
     response_status: int,
     response_headers: Headers,
@@ -184,6 +190,34 @@ def test_handshake() -> None:
         101, [(b"connection", b"Upgrade"), (b"upgrade", b"websocket")],
     )
     assert events == [AcceptConnection()]
+
+
+def test_handshake_applies_max_message_size() -> None:
+    client = WSConnection(CLIENT, max_message_size=0)
+
+    server = h11.Connection(h11.SERVER)
+    server.receive_data(
+        client.send(Request(host="localhost", target="/")),
+    )
+    request = cast("h11.Request", server.next_event())
+    token = generate_accept_token(
+        normed_header_dict(request.headers)[b"sec-websocket-key"],
+    )
+    response = h11.InformationalResponse(
+        status_code=101,
+        headers=[
+            (b"connection", b"Upgrade"),
+            (b"upgrade", b"websocket"),
+            (b"Sec-WebSocket-Accept", token),
+        ],
+    )
+    client.receive_data(server.send(response))
+    list(client.events())
+    client.receive_data(b"\x82\x01x")
+
+    event = next(client.events())
+    assert isinstance(event, CloseConnection)
+    assert event.code == 1009
 
 
 def test_broken_handshake() -> None:

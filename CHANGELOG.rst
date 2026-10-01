@@ -6,6 +6,9 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Add ``max_message_size`` to cap received messages by decompressed byte
+  count. Oversized messages produce a 1009 close event, and compressed
+  messages are decompressed under that budget.
 
 1.3.2 (2025-11-20)
 ------------------
