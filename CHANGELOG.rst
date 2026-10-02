@@ -4,6 +4,14 @@ Release History
 1.4.0 (unreleased)
 ------------------
 
+- Add ``wsproto.handshake.H2Handshake`` for bootstrapping a WebSocket over
+  an RFC 8441 extended CONNECT on an existing HTTP/2 connection. The HTTP/2
+  connection, header blocks and flow control are provided by the caller;
+  wsproto validates the pseudo-headers and regular header boundaries,
+  reuses the existing subprotocol and permessage-deflate negotiation, and
+  then drives the same frame protocol as the HTTP/1.1 handshake. A
+  ``WSConnection`` can now be constructed with a handshake instance, e.g.
+  ``WSConnection(H2Handshake(ConnectionType.CLIENT))``.
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
 
