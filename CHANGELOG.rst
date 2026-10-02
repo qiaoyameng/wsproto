@@ -6,6 +6,10 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Add ``wsproto.handshake.H2Handshake``, an RFC 8441 WebSocket
+  handshake over HTTP/2 (extended CONNECT). It operates on in-memory
+  header lists rather than a network connection and reuses the
+  existing frame protocol once the connection is established.
 
 1.3.2 (2025-11-20)
 ------------------
